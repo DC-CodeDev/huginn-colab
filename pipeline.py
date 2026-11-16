@@ -118,10 +118,11 @@ def run_segmentation_worker(
             )
 
             # Ajuste 1: solo se guarda labels.nii.gz si hay licencia válida
-            # Contrato 2.0: labels.nii.gz debe guardarse siempre en uint8 sobre la grilla de entrada
+            # Contrato 2.0: labels.nii.gz debe guardarse siempre en uint8 con cabecera limpia sobre la grilla de entrada
             labels_nii_path = os.path.join(output_dir, "labels.nii.gz")
             labels_img = nib.Nifti1Image(np.asarray(labels_data, dtype=np.uint8), affine)
             labels_img.set_data_dtype(np.uint8)
+            labels_img.header.set_slope_inter(1.0, 0.0)
             nib.save(labels_img, labels_nii_path)
 
         # -------------------------------------------------------------
@@ -236,7 +237,9 @@ def pack_result_from_arrays(
             shape=input_shape[:3],
         )
         labels_nii_path = os.path.join(output_dir, "labels.nii.gz")
-        labels_img = nib.Nifti1Image(labels_data, affine)
+        labels_img = nib.Nifti1Image(np.asarray(labels_data, dtype=np.uint8), affine)
+        labels_img.set_data_dtype(np.uint8)
+        labels_img.header.set_slope_inter(1.0, 0.0)
         nib.save(labels_img, labels_nii_path)
 
     completed_at = datetime.now(timezone.utc).isoformat()
