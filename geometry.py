@@ -78,7 +78,9 @@ def build_labels_volume(
     shape: Tuple[int, int, int],
 ) -> np.ndarray:
     """
-    Consolida las 4 máscaras anatómicas en un único volumen uint8 crudo (sin rangos HU).
+    Consolida las 4 máscaras anatómicas en un único volumen uint8 crudo (sin rangos HU)
+    sobre la misma grilla (dimensiones, espaciado y afín) del volumen de entrada.
+    Contrato 2.0: labels.nii.gz debe serializarse siempre como uint8 en esa grilla.
     Mapeo de etiquetas:
       1: subcutaneous_fat
       2: torso_fat
