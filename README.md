@@ -45,3 +45,5 @@ git subtree split --prefix=colab -b colab-standalone
 # Crear un repositorio remoto vacío en GitHub (ej. huginn-colab) y luego:
 git push https://github.com/<TU_USUARIO>/huginn-colab.git colab-standalone:main
 ```
+
+Para sincronizar actualizaciones futuras desde `HEAD:colab` hacia el repositorio público, ejecutá `./scripts/publicar-colab.sh` (o con `--dry-run` para simular sin push).
