@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import inspect
 import json
 import logging
 import multiprocessing as mp
@@ -14,7 +16,13 @@ import fastapi
 import nibabel as nib
 import numpy as np
 
-from colab.geometry import analyze_l3, build_labels_volume, build_manifest
+from colab.geometry import (
+    analyze_l3,
+    build_labels_volume,
+    build_labels_volume_from_files,
+    build_manifest,
+)
+from colab.memory import StageMemorySampler
 
 log = logging.getLogger("huginn.pipeline")
 
@@ -23,6 +31,33 @@ TOTALSEGMENTATOR_VERSION = "2.18.0"
 FASTAPI_VERSION = getattr(fastapi, "__version__", "0.141.1")
 NIBABEL_VERSION = getattr(nib, "__version__", "5.5.0")
 NUMPY_VERSION = getattr(np, "__version__", "2.5.2")
+
+
+def _release_cuda_cache() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _call_totalsegmentator(totalsegmentator_fn: Any, **kwargs: Any) -> Any:
+    """
+    Invoca totalsegmentator añadiendo nr_thr_saving=1 y nr_thr_resamp=1
+    si la firma de la función (o **kwargs) los acepta, para reducir uso de RAM.
+    """
+    try:
+        params = inspect.signature(totalsegmentator_fn).parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_kwargs or "nr_thr_saving" in params:
+            kwargs.setdefault("nr_thr_saving", 1)
+        if accepts_kwargs or "nr_thr_resamp" in params:
+            kwargs.setdefault("nr_thr_resamp", 1)
+    except Exception:
+        pass
+    return totalsegmentator_fn(**kwargs)
 
 
 def run_segmentation_worker(
@@ -40,20 +75,29 @@ def run_segmentation_worker(
     Ejecuta las pasadas de TotalSegmentator, analiza L3, empaqueta result.zip y
     comunica el avance mediante status_queue.
     """
+    diagnostics: Dict[str, Any] = {"stages": {}}
+    active_sampler: Optional[StageMemorySampler] = None
+
     try:
         t0 = time.time()
         status_queue.put({"stage": "validating", "progress": 0.05})
+        active_sampler = StageMemorySampler(job_id=job_id, stage="validating").start()
 
         input_img = nib.load(input_path)
         input_shape = input_img.shape
         affine = input_img.affine
+        del input_img
 
         tasks_executed: List[str] = []
+        diagnostics["stages"]["validating"] = active_sampler.stop()
+        active_sampler = None
+        status_queue.put({"diagnostics": diagnostics})
 
         # -------------------------------------------------------------
         # 1. Pasada de vértebras (Localización de L3)
         # -------------------------------------------------------------
         status_queue.put({"stage": "locating_l3", "progress": 0.15})
+        active_sampler = StageMemorySampler(job_id=job_id, stage="locating_l3").start()
         tasks_executed.append("total:roi_subset=vertebrae_L3")
 
         l3_work_dir = os.path.join(output_dir, "work_l3")
@@ -61,7 +105,8 @@ def run_segmentation_worker(
 
         from totalsegmentator.python_api import totalsegmentator
 
-        totalsegmentator(
+        _call_totalsegmentator(
+            totalsegmentator,
             input=input_path,
             output=l3_work_dir,
             task="total",
@@ -70,6 +115,7 @@ def run_segmentation_worker(
         )
 
         l3_file = os.path.join(l3_work_dir, "vertebrae_L3.nii.gz")
+        l3_img = None
         if os.path.exists(l3_file):
             l3_img = nib.load(l3_file)
             l3_data = np.asanyarray(l3_img.dataobj)
@@ -77,58 +123,66 @@ def run_segmentation_worker(
             l3_data = None
 
         l3_analysis = analyze_l3(l3_data, affine)
+        del l3_data, l3_img
+        gc.collect()
+        _release_cuda_cache()
+
+        diagnostics["stages"]["locating_l3"] = active_sampler.stop()
+        active_sampler = None
+        status_queue.put({"diagnostics": diagnostics})
 
         # -------------------------------------------------------------
         # 2. Pasada de tejidos (tissue_4_types)
         # -------------------------------------------------------------
         tissue_segmentation_skipped = not license_valid
         labels_nii_path: Optional[str] = None
+        tissues_work_dir = os.path.join(output_dir, "work_tissues")
 
         if license_valid:
             status_queue.put({"stage": "segmenting_tissues", "progress": 0.50})
+            active_sampler = StageMemorySampler(job_id=job_id, stage="segmenting_tissues").start()
             tasks_executed.append("tissue_4_types")
 
-            tissues_work_dir = os.path.join(output_dir, "work_tissues")
             os.makedirs(tissues_work_dir, exist_ok=True)
 
-            totalsegmentator(
+            _call_totalsegmentator(
+                totalsegmentator,
                 input=input_path,
                 output=tissues_work_dir,
                 task="tissue_4_types",
                 device=device,
             )
 
-            def _load_mask(name: str) -> Optional[np.ndarray]:
-                p = os.path.join(tissues_work_dir, name)
-                if os.path.exists(p):
-                    return np.asanyarray(nib.load(p).dataobj)
-                return None
-
-            subcutaneous = _load_mask("subcutaneous_fat.nii.gz")
-            torso = _load_mask("torso_fat.nii.gz")
-            muscle = _load_mask("skeletal_muscle.nii.gz")
-            intermuscular = _load_mask("intermuscular_fat.nii.gz")
-
-            labels_data = build_labels_volume(
-                subcutaneous_data=subcutaneous,
-                torso_data=torso,
-                muscle_data=muscle,
-                intermuscular_data=intermuscular,
+            labels_data = build_labels_volume_from_files(
+                mask_paths=[
+                    (os.path.join(tissues_work_dir, "subcutaneous_fat.nii.gz"), 1),
+                    (os.path.join(tissues_work_dir, "torso_fat.nii.gz"), 2),
+                    (os.path.join(tissues_work_dir, "skeletal_muscle.nii.gz"), 3),
+                    (os.path.join(tissues_work_dir, "intermuscular_fat.nii.gz"), 4),
+                ],
                 shape=input_shape[:3],
             )
 
             # Ajuste 1: solo se guarda labels.nii.gz si hay licencia válida
             # Contrato 2.0: labels.nii.gz debe guardarse siempre en uint8 con cabecera limpia sobre la grilla de entrada
             labels_nii_path = os.path.join(output_dir, "labels.nii.gz")
-            labels_img = nib.Nifti1Image(np.asarray(labels_data, dtype=np.uint8), affine)
+            labels_img = nib.Nifti1Image(labels_data, affine)
             labels_img.set_data_dtype(np.uint8)
             labels_img.header.set_slope_inter(1.0, 0.0)
             nib.save(labels_img, labels_nii_path)
+            del labels_img, labels_data
+            gc.collect()
+            _release_cuda_cache()
+
+            diagnostics["stages"]["segmenting_tissues"] = active_sampler.stop()
+            active_sampler = None
+            status_queue.put({"diagnostics": diagnostics})
 
         # -------------------------------------------------------------
         # 3. Empaquetado de resultados
         # -------------------------------------------------------------
         status_queue.put({"stage": "packaging", "progress": 0.90})
+        active_sampler = StageMemorySampler(job_id=job_id, stage="packaging").start()
         t1 = time.time()
         completed_at = datetime.now(timezone.utc).isoformat()
         duration_seconds = t1 - t0
@@ -179,14 +233,23 @@ def run_segmentation_worker(
         if license_valid and os.path.exists(tissues_work_dir):
             shutil.rmtree(tissues_work_dir, ignore_errors=True)
 
+        diagnostics["stages"]["packaging"] = active_sampler.stop()
+        active_sampler = None
+
         status_queue.put({
             "stage": "completed",
             "progress": 1.0,
             "status": "completed",
             "completed_at": completed_at,
+            "diagnostics": diagnostics,
         })
 
     except Exception as exc:
+        if active_sampler is not None:
+            try:
+                diagnostics["stages"][active_sampler.stage] = active_sampler.stop()
+            except Exception:
+                pass
         log.exception("Error durante la segmentación del trabajo %s", job_id)
         status_queue.put({
             "stage": "failed",
@@ -194,6 +257,7 @@ def run_segmentation_worker(
             "error_code": "ERR_PIPELINE_FAILED",
             "detail": str(exc),
             "completed_at": datetime.now(timezone.utc).isoformat(),
+            "diagnostics": diagnostics,
         })
 
 

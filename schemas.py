@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -20,6 +20,7 @@ class JobStatusResponse(BaseModel):
     created_at: str
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class HealthResponse(BaseModel):
@@ -33,6 +34,8 @@ class HealthResponse(BaseModel):
     gpu_name: Optional[str] = None
     queue_len: int
     uptime_seconds: float
+    ram_total_mb: Optional[float] = None
+    ram_available_mb: Optional[float] = None
 
 
 class ErrorResponse(BaseModel):

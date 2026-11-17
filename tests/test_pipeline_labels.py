@@ -101,3 +101,100 @@ def test_worker_saves_labels_as_uint8_in_input_grid(tmp_path, monkeypatch, input
 
     assert labels_img.shape == shape
     assert np.allclose(labels_img.affine, affine, atol=1e-4)
+
+
+def test_worker_labels_identical_voxel_by_voxel_and_emits_diagnostics(tmp_path, monkeypatch, capsys):
+    """
+    Verifica que las reducciones de memoria producen labels.nii.gz idénticas
+    vóxel a vóxel respecto a build_labels_volume, con dtype uint8 y encabezado neutro,
+    y que se registran métricas de memoria por etapa sin datos de paciente.
+    """
+    from colab.geometry import build_labels_volume
+
+    shape = (10, 10, 8)
+    affine = np.diag([-1.0, -1.0, 2.0, 1.0])
+    input_data = np.zeros(shape, dtype=np.int16)
+    input_img = nib.Nifti1Image(input_data, affine)
+    input_img.header["descrip"] = b"Paciente Secreto"
+    input_path = str(tmp_path / "input.nii.gz")
+    nib.save(input_img, input_path)
+
+    l3 = np.zeros(shape, dtype=np.uint8)
+    l3[3:7, 3:7, 3:5] = 1
+
+    subcut = np.zeros(shape, dtype=np.uint8)
+    subcut[0:4, 0:4, 1:6] = 1
+    torso = np.zeros(shape, dtype=np.uint8)
+    torso[2:6, 2:6, 1:6] = 1  # solapa con subcut -> debe ganar 2
+    muscle = np.zeros(shape, dtype=np.uint8)
+    muscle[4:8, 4:8, 2:7] = 1  # solapa con torso -> debe ganar 3
+    interm = np.zeros(shape, dtype=np.uint8)
+    interm[5:7, 5:7, 3:6] = 1  # solapa con muscle -> debe ganar 4
+
+    baseline_labels = build_labels_volume(
+        subcutaneous_data=subcut,
+        torso_data=torso,
+        muscle_data=muscle,
+        intermuscular_data=interm,
+        shape=shape,
+    )
+
+    def fake_totalsegmentator(input, output, task, roi_subset=None, device="gpu", nr_thr_saving=1, nr_thr_resamp=1):
+        assert nr_thr_saving == 1
+        assert nr_thr_resamp == 1
+        os.makedirs(output, exist_ok=True)
+        if task == "total":
+            nib.save(nib.Nifti1Image(l3, affine), os.path.join(output, "vertebrae_L3.nii.gz"))
+        elif task == "tissue_4_types":
+            nib.save(nib.Nifti1Image(subcut, affine), os.path.join(output, "subcutaneous_fat.nii.gz"))
+            nib.save(nib.Nifti1Image(torso, affine), os.path.join(output, "torso_fat.nii.gz"))
+            nib.save(nib.Nifti1Image(muscle, affine), os.path.join(output, "skeletal_muscle.nii.gz"))
+            nib.save(nib.Nifti1Image(interm, affine), os.path.join(output, "intermuscular_fat.nii.gz"))
+
+    fake_pkg = types.ModuleType("totalsegmentator")
+    fake_api = types.ModuleType("totalsegmentator.python_api")
+    fake_api.totalsegmentator = fake_totalsegmentator
+    monkeypatch.setitem(sys.modules, "totalsegmentator", fake_pkg)
+    monkeypatch.setitem(sys.modules, "totalsegmentator.python_api", fake_api)
+
+    output_dir = str(tmp_path / "out")
+    os.makedirs(output_dir, exist_ok=True)
+    status_q = queue.Queue()
+
+    run_segmentation_worker(
+        job_id="12345678-test-job",
+        input_path=input_path,
+        output_dir=output_dir,
+        license_valid=True,
+        status_queue=status_q,
+        created_at="2026-01-01T00:00:00Z",
+        started_at="2026-01-01T00:00:01Z",
+        device="cpu",
+    )
+
+    extract_dir = str(tmp_path / "extracted")
+    with zipfile.ZipFile(os.path.join(output_dir, "result.zip"), "r") as zf:
+        zf.extract("labels.nii.gz", extract_dir)
+
+    labels_img = nib.load(os.path.join(extract_dir, "labels.nii.gz"))
+    assert labels_img.get_data_dtype() == np.dtype(np.uint8)
+    worker_labels = np.asanyarray(labels_img.dataobj)
+    assert worker_labels.dtype == np.uint8
+    assert np.array_equal(worker_labels, baseline_labels)
+
+    # Verificar diagnóstico emitido en status_queue
+    messages = []
+    while not status_q.empty():
+        messages.append(status_q.get_nowait())
+    completed_msgs = [m for m in messages if m.get("status") == "completed"]
+    assert len(completed_msgs) == 1
+    diag = completed_msgs[0]["diagnostics"]
+    for stage in ("validating", "locating_l3", "segmenting_tissues", "packaging"):
+        assert stage in diag["stages"]
+        assert diag["stages"][stage]["samples"] >= 1
+        assert diag["stages"][stage]["peak_rss_mb"] is not None
+
+    captured = capsys.readouterr()
+    assert "[mem]" in captured.out
+    assert "[mem-summary]" in captured.out
+    assert "Paciente Secreto" not in captured.out

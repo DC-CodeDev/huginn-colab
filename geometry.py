@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import os
 from typing import Any, Dict, List, Optional, Tuple
 import nibabel as nib
 import numpy as np
@@ -98,6 +100,26 @@ def build_labels_volume(
     if intermuscular_data is not None:
         labels[intermuscular_data > 0] = 4
 
+    return labels
+
+
+def build_labels_volume_from_files(
+    mask_paths: List[Tuple[str, int]],
+    shape: Tuple[int, int, int],
+) -> np.ndarray:
+    """
+    Consolida máscaras NIfTI en un volumen uint8 cargando un archivo por vez
+    y liberándolo inmediatamente para minimizar el pico de RAM.
+    """
+    labels = np.zeros(shape, dtype=np.uint8)
+    for path, label_value in mask_paths:
+        if not os.path.exists(path):
+            continue
+        img = nib.load(path)
+        data = np.asanyarray(img.dataobj)
+        labels[data > 0] = label_value
+        del data, img
+        gc.collect()
     return labels
 
 

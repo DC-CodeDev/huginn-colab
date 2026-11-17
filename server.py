@@ -20,6 +20,12 @@ from fastapi.responses import FileResponse, JSONResponse
 import nibabel as nib
 
 from colab.connection_code import build_connect_link, encode
+from colab.memory import (
+    DEFAULT_MEMORY_ESTIMATION_K,
+    estimate_required_memory_bytes,
+    get_memory_estimation_k,
+    get_system_memory_bytes,
+)
 from colab.pipeline import (
     FASTAPI_VERSION,
     NIBABEL_VERSION,
@@ -106,6 +112,9 @@ if ALLOWED_ORIGIN == "*":
 # Tamaño máximo de subida (Ajuste 6: 500 MB por defecto)
 MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("HUGINN_MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
 
+# Coeficiente k conservador para prechequeo de RAM — a calibrar con mediciones reales
+MEMORY_ESTIMATION_K = get_memory_estimation_k()
+
 # Directorio base de trabajos
 JOBS_BASE_DIR = os.environ.get("HUGINN_JOBS_DIR", "/tmp/huginn/jobs")
 os.makedirs(JOBS_BASE_DIR, exist_ok=True)
@@ -125,6 +134,7 @@ class JobRecord:
         self.created_at = created_at
         self.started_at: Optional[str] = None
         self.completed_at: Optional[str] = None
+        self.diagnostics: Optional[Dict[str, Any]] = None
         self.process: Optional[mp.Process] = None
         self.status_queue: Optional[Any] = None
 
@@ -229,6 +239,8 @@ async def single_worker_loop() -> None:
                         job.detail = msg["detail"]
                     if "completed_at" in msg:
                         job.completed_at = msg["completed_at"]
+                    if "diagnostics" in msg:
+                        job.diagnostics = msg["diagnostics"]
 
                 # Verificar timeout de 15 minutos
                 if time.time() - start_proc_time > timeout_seconds:
@@ -263,6 +275,8 @@ async def single_worker_loop() -> None:
                     job.detail = msg["detail"]
                 if "completed_at" in msg:
                     job.completed_at = msg["completed_at"]
+                if "diagnostics" in msg:
+                    job.diagnostics = msg["diagnostics"]
 
             if job.status == "processing":
                 # Si el proceso murió sin mensaje de éxito
@@ -425,6 +439,10 @@ async def health_endpoint(authorization: Optional[str] = Header(None)):
     if LICENSE_VALID:
         tasks_available.append("tissue_4_types")
 
+    ram_total_b, ram_avail_b = get_system_memory_bytes()
+    ram_total_mb = round(ram_total_b / (1024.0 * 1024.0), 1) if ram_total_b is not None else None
+    ram_available_mb = round(ram_avail_b / (1024.0 * 1024.0), 1) if ram_avail_b is not None else None
+
     return HealthResponse(
         status="healthy",
         ready=is_ready,
@@ -436,6 +454,8 @@ async def health_endpoint(authorization: Optional[str] = Header(None)):
         gpu_name=gpu_name,
         queue_len=job_queue.qsize(),
         uptime_seconds=round(time.time() - server_start_time, 2),
+        ram_total_mb=ram_total_mb,
+        ram_available_mb=ram_available_mb,
     )
 
 
@@ -504,6 +524,25 @@ async def create_job_endpoint(
             },
         )
 
+    # Prechequeo de RAM estimada vs RAM disponible antes de encolar/procesar
+    estimated_bytes = estimate_required_memory_bytes(shape, k=MEMORY_ESTIMATION_K)
+    _, avail_bytes = get_system_memory_bytes()
+    if avail_bytes is not None and estimated_bytes > avail_bytes:
+        est_mb = round(estimated_bytes / (1024.0 * 1024.0), 1)
+        avail_mb = round(avail_bytes / (1024.0 * 1024.0), 1)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "detail": (
+                    f"Memoria insuficiente para procesar el volumen {tuple(shape)}: "
+                    f"se estiman ~{est_mb} MB y hay ~{avail_mb} MB disponibles."
+                ),
+                "error_code": "ERR_INSUFFICIENT_MEMORY",
+                "stage": "validating",
+            },
+        )
+
     created_at = datetime.now(timezone.utc).isoformat()
     record = JobRecord(job_id=job_id, job_dir=job_dir, created_at=created_at)
     jobs_db[job_id] = record
@@ -540,6 +579,7 @@ async def get_job_status_endpoint(job_id: str, authorization: Optional[str] = He
         created_at=job.created_at,
         started_at=job.started_at,
         completed_at=job.completed_at,
+        diagnostics=job.diagnostics,
     )
 
 

@@ -47,3 +47,15 @@ git push https://github.com/<TU_USUARIO>/huginn-colab.git colab-standalone:main
 ```
 
 Para sincronizar actualizaciones futuras desde `HEAD:colab` hacia el repositorio público, ejecutá `./scripts/publicar-colab.sh` (o con `--dry-run` para simular sin push).
+
+## Extensiones aditivas al Contrato 2.0
+
+Los siguientes campos son opcionales y retrocompatibles con clientes 2.0:
+
+- `GET /health`:
+  - `ram_total_mb` (`number | null`): RAM total del sistema en MiB.
+  - `ram_available_mb` (`number | null`): RAM disponible del sistema en MiB.
+- `GET /jobs/{job_id}`:
+  - `diagnostics` (`object | null`): resumen de consumo de memoria por etapa (`stages.<etapa>` con `duration_seconds`, `samples`, `peak_rss_mb`, `peak_sys_used_mb`, `min_sys_avail_mb`, `peak_vram_used_mb`, `peak_vram_allocated_mb`), sin datos de paciente.
+- `POST /jobs`:
+  - Prechequeo de RAM antes de procesar usando `HUGINN_MEMORY_ESTIMATION_K` (por defecto `20.0`, a calibrar con mediciones reales). Si la memoria estimada supera la RAM disponible, rechaza con HTTP `422`, `error_code: "ERR_INSUFFICIENT_MEMORY"` y `stage: "validating"`.
