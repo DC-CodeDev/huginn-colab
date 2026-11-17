@@ -23,6 +23,11 @@ from colab.geometry import (
     build_manifest,
 )
 from colab.memory import StageMemorySampler
+from colab.session_log import (
+    append_log_line,
+    format_stage_label,
+    get_job_log_path,
+)
 
 log = logging.getLogger("huginn.pipeline")
 
@@ -88,11 +93,23 @@ def run_segmentation_worker(
     """
     diagnostics: Dict[str, Any] = {"stages": {}}
     active_sampler: Optional[StageMemorySampler] = None
+    job_log_path = get_job_log_path(job_id)
+
+    def _begin_stage(stage: str, progress: float) -> StageMemorySampler:
+        append_log_line(job_log_path, f"job={job_id[:8]} {format_stage_label(stage)}")
+        status_queue.put({"stage": stage, "progress": progress})
+        return StageMemorySampler(job_id=job_id, stage=stage, log_path=job_log_path).start()
+
+    def _end_stage(sampler: StageMemorySampler, push_diagnostics: bool = True) -> None:
+        diagnostics["stages"][sampler.stage] = sampler.stop()
+        if sampler.last_summary_line:
+            status_queue.put({"mem_summary": sampler.last_summary_line})
+        if push_diagnostics:
+            status_queue.put({"diagnostics": diagnostics})
 
     try:
         t0 = time.time()
-        status_queue.put({"stage": "validating", "progress": 0.05})
-        active_sampler = StageMemorySampler(job_id=job_id, stage="validating").start()
+        active_sampler = _begin_stage("validating", 0.05)
 
         input_img = nib.load(input_path)
         input_shape = input_img.shape
@@ -100,15 +117,13 @@ def run_segmentation_worker(
         del input_img
 
         tasks_executed: List[str] = []
-        diagnostics["stages"]["validating"] = active_sampler.stop()
+        _end_stage(active_sampler)
         active_sampler = None
-        status_queue.put({"diagnostics": diagnostics})
 
         # -------------------------------------------------------------
         # 1. Pasada de vértebras (Localización de L3)
         # -------------------------------------------------------------
-        status_queue.put({"stage": "locating_l3", "progress": 0.15})
-        active_sampler = StageMemorySampler(job_id=job_id, stage="locating_l3").start()
+        active_sampler = _begin_stage("locating_l3", 0.15)
         tasks_executed.append("total:roi_subset=vertebrae_L3")
 
         l3_work_dir = os.path.join(output_dir, "work_l3")
@@ -138,9 +153,8 @@ def run_segmentation_worker(
         gc.collect()
         _release_cuda_cache()
 
-        diagnostics["stages"]["locating_l3"] = active_sampler.stop()
+        _end_stage(active_sampler)
         active_sampler = None
-        status_queue.put({"diagnostics": diagnostics})
 
         # -------------------------------------------------------------
         # 2. Pasada de tejidos (tissue_4_types)
@@ -150,8 +164,7 @@ def run_segmentation_worker(
         tissues_work_dir = os.path.join(output_dir, "work_tissues")
 
         if license_valid:
-            status_queue.put({"stage": "segmenting_tissues", "progress": 0.50})
-            active_sampler = StageMemorySampler(job_id=job_id, stage="segmenting_tissues").start()
+            active_sampler = _begin_stage("segmenting_tissues", 0.50)
             tasks_executed.append("tissue_4_types")
 
             os.makedirs(tissues_work_dir, exist_ok=True)
@@ -185,15 +198,13 @@ def run_segmentation_worker(
             gc.collect()
             _release_cuda_cache()
 
-            diagnostics["stages"]["segmenting_tissues"] = active_sampler.stop()
+            _end_stage(active_sampler)
             active_sampler = None
-            status_queue.put({"diagnostics": diagnostics})
 
         # -------------------------------------------------------------
         # 3. Empaquetado de resultados
         # -------------------------------------------------------------
-        status_queue.put({"stage": "packaging", "progress": 0.90})
-        active_sampler = StageMemorySampler(job_id=job_id, stage="packaging").start()
+        active_sampler = _begin_stage("packaging", 0.90)
         t1 = time.time()
         completed_at = datetime.now(timezone.utc).isoformat()
         duration_seconds = t1 - t0
@@ -244,9 +255,10 @@ def run_segmentation_worker(
         if license_valid and os.path.exists(tissues_work_dir):
             shutil.rmtree(tissues_work_dir, ignore_errors=True)
 
-        diagnostics["stages"]["packaging"] = active_sampler.stop()
+        _end_stage(active_sampler, push_diagnostics=False)
         active_sampler = None
 
+        append_log_line(job_log_path, f"job={job_id[:8]} {format_stage_label('completed')}")
         status_queue.put({
             "stage": "completed",
             "progress": 1.0,
@@ -258,9 +270,10 @@ def run_segmentation_worker(
     except Exception as exc:
         if active_sampler is not None:
             try:
-                diagnostics["stages"][active_sampler.stage] = active_sampler.stop()
+                _end_stage(active_sampler, push_diagnostics=False)
             except Exception:
                 pass
+        append_log_line(job_log_path, f"job={job_id[:8]} {format_stage_label('failed')} (ERR_PIPELINE_FAILED)")
         log.exception("Error durante la segmentación del trabajo %s", job_id)
         status_queue.put({
             "stage": "failed",

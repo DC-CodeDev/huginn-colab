@@ -6,6 +6,8 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 # Coeficiente k provisional (múltiplo sobre el tamaño float32 del volumen remuestreado a 1,5 mm)
+from colab.session_log import append_log_line
+
 # Valor inicial provisional: a calibrar con mediciones reales de [mem-summary] en Colab.
 DEFAULT_MEMORY_ESTIMATION_K = 100.0
 TARGET_RESAMPLE_SPACING_MM = 1.5
@@ -141,10 +143,13 @@ class StageMemorySampler:
         job_id: str,
         stage: str,
         interval_seconds: float = 1.0,
+        log_path: Optional[str] = None,
     ) -> None:
         self.job_id = job_id
         self.stage = stage
         self.interval_seconds = interval_seconds
+        self.log_path = log_path
+        self.last_summary_line: Optional[str] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._t0 = 0.0
@@ -201,7 +206,10 @@ class StageMemorySampler:
         if vram_used_b is not None and vram_total_b is not None:
             parts.append(f"vram_used={_bytes_to_mb(vram_used_b)}/{_bytes_to_mb(vram_total_b)}MB")
             parts.append(f"vram_max_alloc={_bytes_to_mb(vram_max_alloc_b)}MB")
-        print(" ".join(parts), flush=True)
+        line = " ".join(parts)
+        print(line, flush=True)
+        if self.log_path:
+            append_log_line(self.log_path, line)
 
     def _run(self) -> None:
         self._sample_once()
@@ -245,12 +253,15 @@ class StageMemorySampler:
                 "peak_vram_allocated_mb": _bytes_to_mb(self._peak_vram_alloc_b),
             }
 
-        print(
+        summary_line = (
             f"[mem-summary] job={self.job_id[:8]} stage={self.stage} "
             f"duration={duration}s "
             f"peak_rss={summary['peak_rss_mb']}MB "
             f"peak_vram_used={summary['peak_vram_used_mb']}MB "
-            f"peak_vram_alloc={summary['peak_vram_allocated_mb']}MB",
-            flush=True,
+            f"peak_vram_alloc={summary['peak_vram_allocated_mb']}MB"
         )
+        self.last_summary_line = summary_line
+        print(summary_line, flush=True)
+        if self.log_path:
+            append_log_line(self.log_path, summary_line)
         return summary

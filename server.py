@@ -40,6 +40,18 @@ from colab.schemas import (
     JobStatusResponse,
     PurgeResponse,
 )
+from colab.session_log import (
+    append_log_line,
+    format_huginn_line,
+    format_stage_label,
+    get_session_log_path,
+    monitor_session_logs,
+)
+from colab.version import (
+    SERVICE_VERSION,
+    check_code_staleness,
+    format_version_banner,
+)
 
 # Configuración de Logging
 logging.basicConfig(
@@ -172,6 +184,62 @@ def _verify_token(authorization: Optional[str]) -> None:
         )
 
 
+def _active_secrets() -> tuple[str, ...]:
+    """Secretos activos a enmascarar en cualquier salida de log de sesión."""
+    candidates = [
+        API_TOKEN,
+        TOTALSEG_LICENSE or "",
+        os.environ.get("NGROK_AUTHTOKEN", ""),
+        os.environ.get("GITHUB_TOKEN", ""),
+    ]
+    return tuple(c for c in candidates if c)
+
+
+def _drain_worker_status_queue(
+    job: JobRecord,
+    status_queue: Any,
+    last_stage_ref: list[Optional[str]],
+    session_log_path: str,
+) -> None:
+    """Lee mensajes del subproceso worker, actualiza JobRecord y reenvía eventos al log de sesión."""
+    secrets_mask = _active_secrets()
+    short_id = job.job_id[:8]
+    while not status_queue.empty():
+        msg = status_queue.get_nowait()
+        if "stage" in msg:
+            job.stage = msg["stage"]
+        if "progress" in msg:
+            job.progress = msg["progress"]
+        if "status" in msg:
+            job.status = msg["status"]
+        if "error_code" in msg:
+            job.error_code = msg["error_code"]
+        if "detail" in msg:
+            job.detail = msg["detail"]
+        if "completed_at" in msg:
+            job.completed_at = msg["completed_at"]
+        if "diagnostics" in msg:
+            job.diagnostics = msg["diagnostics"]
+
+        if "stage" in msg and msg["stage"] != last_stage_ref[0]:
+            last_stage_ref[0] = msg["stage"]
+            label = format_stage_label(msg["stage"])
+            if msg["stage"] == "failed" and msg.get("error_code"):
+                label = f"{label} ({msg['error_code']})"
+            append_log_line(
+                session_log_path,
+                format_huginn_line(f"job={short_id} {label}", extra_secrets=secrets_mask),
+                extra_secrets=secrets_mask,
+            )
+
+        if "mem_summary" in msg and msg["mem_summary"]:
+            append_log_line(
+                session_log_path,
+                format_huginn_line(msg["mem_summary"], extra_secrets=secrets_mask),
+                extra_secrets=secrets_mask,
+            )
+
+
 async def single_worker_loop() -> None:
     """Worker secuencial: procesa 1 trabajo a la vez para no sobrecargar la GPU."""
     spawn_ctx = mp.get_context("spawn")
@@ -190,8 +258,25 @@ async def single_worker_loop() -> None:
             job.started_at = datetime.now(timezone.utc).isoformat()
             input_path = os.path.join(job.job_dir, "input.nii.gz")
 
+            session_log_path = get_session_log_path()
+            secrets_mask = _active_secrets()
+            append_log_line(
+                session_log_path,
+                format_huginn_line(f"job={job.job_id[:8]} iniciado"),
+                extra_secrets=secrets_mask,
+            )
+            stale_msg = check_code_staleness()
+            if stale_msg:
+                log.warning(stale_msg)
+                append_log_line(
+                    session_log_path,
+                    format_huginn_line(f"AVISO: {stale_msg}"),
+                    extra_secrets=secrets_mask,
+                )
+
             status_queue = spawn_ctx.Queue()
             job.status_queue = status_queue
+            last_stage_ref: list[Optional[str]] = [None]
 
             device = "gpu"
             try:
@@ -225,22 +310,7 @@ async def single_worker_loop() -> None:
 
             while proc.is_alive():
                 # Leer actualizaciones del proceso hijo si las hay
-                while not status_queue.empty():
-                    msg = status_queue.get_nowait()
-                    if "stage" in msg:
-                        job.stage = msg["stage"]
-                    if "progress" in msg:
-                        job.progress = msg["progress"]
-                    if "status" in msg:
-                        job.status = msg["status"]
-                    if "error_code" in msg:
-                        job.error_code = msg["error_code"]
-                    if "detail" in msg:
-                        job.detail = msg["detail"]
-                    if "completed_at" in msg:
-                        job.completed_at = msg["completed_at"]
-                    if "diagnostics" in msg:
-                        job.diagnostics = msg["diagnostics"]
+                _drain_worker_status_queue(job, status_queue, last_stage_ref, session_log_path)
 
                 # Verificar timeout de 15 minutos
                 if time.time() - start_proc_time > timeout_seconds:
@@ -253,6 +323,11 @@ async def single_worker_loop() -> None:
                     job.error_code = "ERR_PROCESSING_TIMEOUT"
                     job.detail = "El trabajo excedió el tiempo límite de procesamiento de 15 minutos."
                     job.completed_at = datetime.now(timezone.utc).isoformat()
+                    append_log_line(
+                        session_log_path,
+                        format_huginn_line(f"job={job_id[:8]} {format_stage_label('failed')} (ERR_PROCESSING_TIMEOUT)"),
+                        extra_secrets=secrets_mask,
+                    )
                     break
 
                 await asyncio.sleep(0.5)
@@ -261,22 +336,7 @@ async def single_worker_loop() -> None:
             proc.join(timeout=2.0)
 
             # Vaciar mensajes finales de la cola
-            while not status_queue.empty():
-                msg = status_queue.get_nowait()
-                if "status" in msg:
-                    job.status = msg["status"]
-                if "stage" in msg:
-                    job.stage = msg["stage"]
-                if "progress" in msg:
-                    job.progress = msg["progress"]
-                if "error_code" in msg:
-                    job.error_code = msg["error_code"]
-                if "detail" in msg:
-                    job.detail = msg["detail"]
-                if "completed_at" in msg:
-                    job.completed_at = msg["completed_at"]
-                if "diagnostics" in msg:
-                    job.diagnostics = msg["diagnostics"]
+            _drain_worker_status_queue(job, status_queue, last_stage_ref, session_log_path)
 
             if job.status == "processing":
                 # Si el proceso murió sin mensaje de éxito
@@ -374,7 +434,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Huginn TotalSegmentator Colab Service",
-    version="2.0.0",
+    version=SERVICE_VERSION,
     lifespan=lifespan,
 )
 
@@ -692,14 +752,20 @@ def setup_ngrok_auth(token: str) -> None:
 def start_server_colab(
     ngrok_domain: Optional[str] = None,
     app_url: Optional[str] = None,
+    monitor: bool = True,
 ) -> str:
     """
-    Inicia Uvicorn en un hilo daemon y abre el túnel ngrok.
+    Inicia Uvicorn en un hilo daemon, abre el túnel ngrok y monitorea los logs de sesión.
     Soporta NGROK_DOMAIN y APP_URL opcionales.
     """
     import threading
     import uvicorn
     from pyngrok import ngrok
+
+    print(format_version_banner(), flush=True)
+    stale_msg = check_code_staleness()
+    if stale_msg:
+        print(f"[huginn] AVISO: {stale_msg}", flush=True)
 
     ngrok_token = _get_secret("NGROK_AUTHTOKEN")
     if not ngrok_token or not ngrok_token.strip():
@@ -753,7 +819,14 @@ def start_server_colab(
         print(f"ENLACE DE CONEXION: {connect_link}")
     print(f"CODIGO DE CONEXION: {connection_code}")
     print("Este código contiene tu token. No compartas el notebook con la salida guardada: Editar > Borrar todas las salidas antes de compartir.")
-    print("========================================================\n")
+    print("========================================================\n", flush=True)
+
+    if monitor:
+        session_log_path = get_session_log_path()
+        start_offset = os.path.getsize(session_log_path) if os.path.exists(session_log_path) else 0
+        print("[huginn] Monitoreando actividad del servidor (Detener celda corta solo el monitor)...", flush=True)
+        monitor_session_logs(log_path=session_log_path, start_offset=start_offset)
+
     return public_url
 
 
