@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing as mp
 import os
 import secrets
 import shutil
+import socket
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import fastapi
 from fastapi import FastAPI, File, Header, HTTPException, Request, Response, UploadFile, status
@@ -713,6 +719,28 @@ async def delete_job_endpoint(job_id: str, authorization: Optional[str] = Header
 # ---------------------------------------------------------------------------
 # Entrada Colab
 # ---------------------------------------------------------------------------
+@dataclass
+class _ServerRuntimeState:
+    """Registro a nivel de módulo del servidor Uvicorn y túnel ngrok activos."""
+
+    server: Optional[Any] = None
+    thread: Optional[threading.Thread] = None
+    tunnel: Optional[Any] = None
+    public_url: Optional[str] = None
+    port: Optional[int] = None
+    commit_hash: Optional[str] = None
+    startup_error: Optional[BaseException] = None
+
+
+_runtime_lock = threading.Lock()
+_runtime_state = _ServerRuntimeState()
+
+STALE_RESTART_BANNER = (
+    "Hay una versión más nueva del servicio. "
+    "Para cargarla: Entorno de ejecución > Reiniciar sesión y ejecutar todo"
+)
+
+
 def format_ngrok_url(domain: str) -> str:
     """
     Construye la URL completa con https:// a partir de NGROK_DOMAIN,
@@ -749,63 +777,221 @@ def setup_ngrok_auth(token: str) -> None:
     conf.get_default().auth_token = token_clean
 
 
-def start_server_colab(
-    ngrok_domain: Optional[str] = None,
-    app_url: Optional[str] = None,
-    monitor: bool = True,
-) -> str:
-    """
-    Inicia Uvicorn en un hilo daemon, abre el túnel ngrok y monitorea los logs de sesión.
-    Soporta NGROK_DOMAIN y APP_URL opcionales.
-    """
-    import threading
-    import uvicorn
+def _sanitize_runtime_message(message: str) -> str:
+    """Enmascara secretos activos y códigos de conexión en mensajes impresos o errores."""
+    from colab.session_log import sanitize_log_text
+
+    return sanitize_log_text(message, extra_secrets=_active_secrets())
+
+
+def _find_active_processing_jobs() -> List[JobRecord]:
+    """Devuelve los trabajos que están actualmente en procesamiento o con subproceso vivo."""
+    active: List[JobRecord] = []
+    for job in list(jobs_db.values()):
+        proc_alive = False
+        if job.process is not None:
+            try:
+                proc_alive = bool(job.process.is_alive())
+            except Exception:
+                proc_alive = False
+        if job.status == "processing" or proc_alive:
+            active.append(job)
+    return active
+
+
+def _probe_health_url(url: str, timeout: float = 3.0) -> Tuple[bool, str]:
+    """Consulta GET /health con Bearer token y devuelve (ok, detalle)."""
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/health",
+        headers={
+            "Authorization": f"Bearer {API_TOKEN}",
+            "ngrok-skip-browser-warning": "true",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status_code = getattr(resp, "status", resp.getcode())
+            body = resp.read().decode("utf-8", errors="replace")
+            if status_code != 200:
+                return False, f"HTTP {status_code}"
+            data = json.loads(body)
+            if data.get("status") != "healthy":
+                return False, f"estado inesperado: {data.get('status')}"
+            return True, "ok"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return False, _sanitize_runtime_message(str(exc.reason or exc))
+    except Exception as exc:
+        return False, _sanitize_runtime_message(str(exc))
+
+
+def _is_ngrok_tunnel_active(public_url: Optional[str]) -> bool:
+    """Verifica si el túnel ngrok registrado sigue activo en pyngrok."""
+    if not public_url:
+        return False
+    try:
+        from pyngrok import ngrok
+
+        tunnels = ngrok.get_tunnels()
+        if isinstance(tunnels, (list, tuple)):
+            return any(str(getattr(t, "public_url", "")) == public_url for t in tunnels)
+        return True
+    except Exception:
+        return False
+
+
+def _is_own_server_healthy() -> bool:
+    """Devuelve True si el servidor propio de esta sesión está vivo, sano y con túnel activo."""
+    srv = _runtime_state.server
+    thr = _runtime_state.thread
+    if srv is None or thr is None or not thr.is_alive():
+        return False
+    if not getattr(srv, "started", False) or getattr(srv, "should_exit", False):
+        return False
+    port = _runtime_state.port or PORT
+    local_ok, _ = _probe_health_url(f"http://127.0.0.1:{port}", timeout=3.0)
+    if not local_ok:
+        return False
+    return _is_ngrok_tunnel_active(_runtime_state.public_url)
+
+
+def _wait_for_port_free(port: int, timeout: float = 5.0) -> bool:
+    """Espera brevemente hasta que el puerto local deje de aceptar conexiones."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            if sock.connect_ex(("127.0.0.1", port)) != 0:
+                return True
+        time.sleep(0.1)
+    return False
+
+
+def _shutdown_existing_service(timeout: float = 5.0) -> None:
+    """Cierra de forma limpia el uvicorn propio, túneles ngrok, agente ngrok y espera el puerto."""
+    srv = _runtime_state.server
+    thr = _runtime_state.thread
+    pub_url = _runtime_state.public_url
+    port = _runtime_state.port or PORT
+
+    if srv is not None:
+        srv.should_exit = True
+    if thr is not None and thr.is_alive():
+        thr.join(timeout=timeout)
+        if thr.is_alive() and srv is not None:
+            srv.force_exit = True
+            thr.join(timeout=2.0)
+
+    try:
+        from pyngrok import ngrok
+
+        if pub_url:
+            try:
+                ngrok.disconnect(pub_url)
+            except Exception:
+                pass
+        try:
+            tunnels = ngrok.get_tunnels()
+            if isinstance(tunnels, (list, tuple)):
+                for t in tunnels:
+                    t_url = getattr(t, "public_url", None)
+                    if t_url:
+                        try:
+                            ngrok.disconnect(t_url)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        try:
+            ngrok.kill()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    if srv is not None or (thr is not None):
+        _wait_for_port_free(port, timeout=timeout)
+
+    _runtime_state.server = None
+    _runtime_state.thread = None
+    _runtime_state.tunnel = None
+    _runtime_state.public_url = None
+    _runtime_state.port = None
+    _runtime_state.commit_hash = None
+    _runtime_state.startup_error = None
+
+
+def _is_ngrok_endpoint_online_error(exc: BaseException) -> bool:
+    """Detecta ERR_NGROK_334 (dominio/endpoint fijo ya en línea en otra sesión)."""
+    msg = str(exc)
+    msg_lower = msg.lower()
+    return "ERR_NGROK_334" in msg or ("already online" in msg_lower and "endpoint" in msg_lower)
+
+
+def _format_ngrok_error_message(exc: BaseException, has_fixed_domain: bool) -> str:
+    """Traduce errores de ngrok a mensajes accionables sin exponer credenciales."""
+    safe_err = _sanitize_runtime_message(str(exc))
+    if _is_ngrok_endpoint_online_error(exc):
+        return (
+            "El dominio fijo de ngrok sigue ocupado por una sesión anterior (ERR_NGROK_334) "
+            "y no se liberó dentro del tiempo de espera. "
+            "Qué hacer: 1) Cerrá el agente anterior en https://dashboard.ngrok.com/agents "
+            "o esperá unos minutos a que expire la sesión previa; "
+            "2) O dejá NGROK_DOMAIN vacío en la Celda 1 para usar una URL aleatoria."
+        )
+    if has_fixed_domain:
+        return f"No se pudo abrir el túnel ngrok con dominio fijo: {safe_err}"
+    return f"No se pudo abrir el túnel ngrok: {safe_err}"
+
+
+def _connect_ngrok_with_retry(
+    port: int,
+    fixed_url: Optional[str],
+    retry_interval: float = 5.0,
+    retry_timeout: float = 120.0,
+) -> Any:
+    """Abre el túnel ngrok; ante ERR_NGROK_334 reintenta con espera acotada."""
     from pyngrok import ngrok
 
-    print(format_version_banner(), flush=True)
-    stale_msg = check_code_staleness()
-    if stale_msg:
-        print(f"[huginn] AVISO: {stale_msg}", flush=True)
+    deadline = time.monotonic() + max(0.0, retry_timeout)
+    start_ts = time.monotonic()
 
-    ngrok_token = _get_secret("NGROK_AUTHTOKEN")
-    if not ngrok_token or not ngrok_token.strip():
-        raise ValueError("NGROK_AUTHTOKEN requerido en Secretos o variables de entorno.")
+    while True:
+        try:
+            if fixed_url:
+                return ngrok.connect(port, url=fixed_url)
+            return ngrok.connect(port)
+        except Exception as exc:
+            if fixed_url and _is_ngrok_endpoint_online_error(exc):
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining > 0:
+                    wait_s = min(retry_interval, remaining)
+                    elapsed = now - start_ts
+                    print(
+                        f"[huginn] Dominio fijo de ngrok ocupado por una sesión anterior (ERR_NGROK_334). "
+                        f"Reintentando en {wait_s:.0f}s ({elapsed:.0f}s / {retry_timeout:.0f}s)...",
+                        flush=True,
+                    )
+                    time.sleep(wait_s)
+                    continue
+            raise RuntimeError(_format_ngrok_error_message(exc, bool(fixed_url))) from exc
 
-    setup_ngrok_auth(ngrok_token)
 
-    # Iniciar Uvicorn
-    thread = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning"),
-        daemon=True,
-    )
-    thread.start()
-    time.sleep(1.0)
-
-    # Abrir túnel ngrok con dominio opcional
-    resolved_domain = (
-        ngrok_domain
-        or os.environ.get("NGROK_DOMAIN")
-        or _get_secret("NGROK_DOMAIN")
-        or ""
-    ).strip()
-    if resolved_domain:
-        fixed_url = format_ngrok_url(resolved_domain)
-        log.info("Abriendo túnel ngrok con URL fija: %s", fixed_url)
-        tunnel = ngrok.connect(PORT, url=fixed_url)
-    else:
-        log.info("Abriendo túnel ngrok con URL aleatoria.")
-        print("Nota: NGROK_DOMAIN no está configurado; la URL de ngrok cambiará en cada sesión.")
-        tunnel = ngrok.connect(PORT)
-
-    public_url = str(tunnel.public_url)
-    connection_code = encode(public_url, API_TOKEN)
-    resolved_app_url = (
+def _resolve_app_url(app_url: Optional[str]) -> str:
+    return (
         app_url
         or os.environ.get("HUGINN_APP_URL")
         or _get_secret("APP_URL")
         or ""
     ).strip().rstrip("/")
 
+
+def _print_connection_banner(public_url: str, resolved_app_url: str) -> None:
+    """Imprime el banner de conexión en la salida de la celda (nunca en archivos de log)."""
+    connection_code = encode(public_url, API_TOKEN)
     print("\n========================================================")
     print(f"HUGINN SERVICE V2 ONLINE: {public_url}")
     if resolved_app_url:
@@ -821,11 +1007,163 @@ def start_server_colab(
     print("Este código contiene tu token. No compartas el notebook con la salida guardada: Editar > Borrar todas las salidas antes de compartir.")
     print("========================================================\n", flush=True)
 
+
+def _run_monitor_loop() -> None:
+    session_log_path = get_session_log_path()
+    start_offset = os.path.getsize(session_log_path) if os.path.exists(session_log_path) else 0
+    print(
+        "[huginn] Monitoreando actividad del servidor. "
+        "Para volver a ejecutar esta celda, primero detenela con el botón Stop "
+        "(detenerla corta solo el monitor y no apaga el servicio).",
+        flush=True,
+    )
+    monitor_session_logs(log_path=session_log_path, start_offset=start_offset)
+
+
+def start_server_colab(
+    ngrok_domain: Optional[str] = None,
+    app_url: Optional[str] = None,
+    monitor: bool = True,
+    ngrok_retry_interval: float = 5.0,
+    ngrok_retry_timeout: float = 120.0,
+) -> str:
+    """
+    Inicia Uvicorn en un hilo daemon de forma idempotente, abre el túnel ngrok,
+    verifica /health por la URL pública y monitorea los logs de sesión.
+    """
+    import uvicorn
+
+    from colab.version import LOADED_COMMIT_HASH
+
+    print(format_version_banner(), flush=True)
+    resolved_app_url = _resolve_app_url(app_url)
+
+    # 1. Commit distinto en disco: no reiniciar en el mismo kernel
+    stale_msg = check_code_staleness()
+    if stale_msg:
+        print("\n========================================================")
+        print(f"⚠️  {STALE_RESTART_BANNER}")
+        print(f"Detalle: {stale_msg}")
+        print("========================================================\n", flush=True)
+        return _runtime_state.public_url or ""
+
+    # 2. Servidor propio vivo, sano y del mismo commit: reenganchar monitor sin reiniciar
+    with _runtime_lock:
+        if _is_own_server_healthy():
+            public_url = str(_runtime_state.public_url)
+            print("[huginn] Servicio ya activo, reconectando monitor", flush=True)
+            _print_connection_banner(public_url, resolved_app_url)
+            reuse_monitor = True
+        else:
+            reuse_monitor = False
+            # 3. No matar un job en curso antes de intentar cualquier cierre/rearranque
+            active_jobs = _find_active_processing_jobs()
+            if active_jobs:
+                job_desc = ", ".join(
+                    f"{j.job_id[:8]} ({j.stage})" for j in active_jobs
+                )
+                msg = (
+                    "[huginn] Reinicio rechazado: hay trabajo(s) en procesamiento "
+                    f"[{job_desc}]. Esperá a que finalice antes de reiniciar el servicio."
+                )
+                print(msg, flush=True)
+                raise RuntimeError(msg)
+
+            # 4. Cierre limpio de cualquier instancia/túnel previo roto o zombi
+            _shutdown_existing_service()
+
+            ngrok_token = _get_secret("NGROK_AUTHTOKEN")
+            if not ngrok_token or not ngrok_token.strip():
+                raise ValueError("NGROK_AUTHTOKEN requerido en Secretos o variables de entorno.")
+
+            setup_ngrok_auth(ngrok_token)
+
+            # Iniciar Uvicorn con instancia Server registrada
+            config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="warning")
+            uv_server = uvicorn.Server(config)
+            _runtime_state.server = uv_server
+            _runtime_state.port = PORT
+            _runtime_state.commit_hash = LOADED_COMMIT_HASH
+            _runtime_state.startup_error = None
+
+            def _serve_target() -> None:
+                try:
+                    uv_server.run()
+                except BaseException as exc:
+                    _runtime_state.startup_error = exc
+
+            thread = threading.Thread(target=_serve_target, daemon=True)
+            _runtime_state.thread = thread
+            thread.start()
+
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if _runtime_state.startup_error is not None:
+                    err = _runtime_state.startup_error
+                    _shutdown_existing_service()
+                    safe_err = _sanitize_runtime_message(str(err))
+                    raise RuntimeError(
+                        f"Error al iniciar el servidor en el puerto {PORT} (¿puerto ocupado?): {safe_err}"
+                    ) from err
+                if getattr(uv_server, "started", False):
+                    break
+                if not thread.is_alive():
+                    _shutdown_existing_service()
+                    raise RuntimeError(
+                        f"El servidor uvicorn terminó inesperadamente al iniciar en el puerto {PORT}."
+                    )
+                time.sleep(0.05)
+
+            if not getattr(uv_server, "started", False):
+                _shutdown_existing_service()
+                raise RuntimeError(
+                    f"Timeout esperando que uvicorn inicie en el puerto {PORT}."
+                )
+
+            # Abrir túnel ngrok con dominio opcional y reintento acotado ante ERR_NGROK_334
+            resolved_domain = (
+                ngrok_domain
+                or os.environ.get("NGROK_DOMAIN")
+                or _get_secret("NGROK_DOMAIN")
+                or ""
+            ).strip()
+            fixed_url: Optional[str] = None
+            if resolved_domain:
+                fixed_url = format_ngrok_url(resolved_domain)
+                log.info("Abriendo túnel ngrok con URL fija: %s", fixed_url)
+            else:
+                log.info("Abriendo túnel ngrok con URL aleatoria.")
+                print("Nota: NGROK_DOMAIN no está configurado; la URL de ngrok cambiará en cada sesión.")
+
+            try:
+                tunnel = _connect_ngrok_with_retry(
+                    PORT,
+                    fixed_url=fixed_url,
+                    retry_interval=ngrok_retry_interval,
+                    retry_timeout=ngrok_retry_timeout,
+                )
+            except Exception:
+                _shutdown_existing_service()
+                raise
+
+            public_url = str(tunnel.public_url)
+            _runtime_state.tunnel = tunnel
+            _runtime_state.public_url = public_url
+
+            _print_connection_banner(public_url, resolved_app_url)
+
+            # Autochequeo de /health por la URL pública
+            pub_ok, pub_detail = _probe_health_url(public_url, timeout=10.0)
+            if pub_ok:
+                print("[huginn] Servicio accesible desde internet", flush=True)
+            else:
+                print(
+                    f"[huginn] AVISO: No se pudo verificar /health por la URL pública ({pub_detail}).",
+                    flush=True,
+                )
+
     if monitor:
-        session_log_path = get_session_log_path()
-        start_offset = os.path.getsize(session_log_path) if os.path.exists(session_log_path) else 0
-        print("[huginn] Monitoreando actividad del servidor (Detener celda corta solo el monitor)...", flush=True)
-        monitor_session_logs(log_path=session_log_path, start_offset=start_offset)
+        _run_monitor_loop()
 
     return public_url
 
