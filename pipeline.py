@@ -22,7 +22,11 @@ from colab.geometry import (
     build_labels_volume_from_files,
     build_manifest,
 )
-from colab.memory import StageMemorySampler
+from colab.memory import (
+    StageMemorySampler,
+    compute_volume_geometry_stats,
+    estimate_required_memory_bytes,
+)
 from colab.session_log import (
     append_log_line,
     format_stage_label,
@@ -114,7 +118,25 @@ def run_segmentation_worker(
         input_img = nib.load(input_path)
         input_shape = input_img.shape
         affine = input_img.affine
+        zooms = tuple(float(z) for z in input_img.header.get_zooms()[:3])
         del input_img
+
+        vol_stats = compute_volume_geometry_stats(input_shape, spacing=zooms)
+        est_mb = round(estimate_required_memory_bytes(input_shape, spacing=zooms) / (1024.0 * 1024.0), 1)
+        vol_stats["estimated_ram_mb"] = est_mb
+        diagnostics["volume"] = vol_stats
+
+        volume_line = (
+            f"[volume] job={job_id[:8]} "
+            f"shape={tuple(vol_stats['shape'])} "
+            f"spacing_mm={tuple(vol_stats['spacing_mm']) if vol_stats['spacing_mm'] else None} "
+            f"orig_voxels={vol_stats['original_voxels']} "
+            f"resampled_1_5mm_voxels={vol_stats['resampled_voxels']} "
+            f"est_ram_mb={est_mb}"
+        )
+        print(volume_line, flush=True)
+        append_log_line(job_log_path, volume_line)
+        status_queue.put({"log_line": volume_line})
 
         tasks_executed: List[str] = []
         _end_stage(active_sampler)

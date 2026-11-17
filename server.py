@@ -27,8 +27,10 @@ import nibabel as nib
 
 from colab.connection_code import build_connect_link, encode
 from colab.memory import (
+    DEFAULT_MEMORY_BASE_MB,
     DEFAULT_MEMORY_ESTIMATION_K,
     estimate_required_memory_bytes,
+    get_memory_base_mb,
     get_memory_estimation_k,
     get_system_memory_bytes,
 )
@@ -130,8 +132,13 @@ if ALLOWED_ORIGIN == "*":
 # Tamaño máximo de subida (Ajuste 6: 500 MB por defecto)
 MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("HUGINN_MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
 
-# Coeficiente k conservador para prechequeo de RAM — a calibrar con mediciones reales
+# Constantes provisionales para prechequeo de RAM (calibrados con 1 punto, revisar)
+MEMORY_BASE_MB = get_memory_base_mb()
 MEMORY_ESTIMATION_K = get_memory_estimation_k()
+
+
+class ActiveJobRestartError(RuntimeError):
+    """Error interno cuando se rechaza el reinicio por haber un job en procesamiento."""
 
 # Directorio base de trabajos
 JOBS_BASE_DIR = os.environ.get("HUGINN_JOBS_DIR", "/tmp/huginn/jobs")
@@ -242,6 +249,13 @@ def _drain_worker_status_queue(
             append_log_line(
                 session_log_path,
                 format_huginn_line(msg["mem_summary"], extra_secrets=secrets_mask),
+                extra_secrets=secrets_mask,
+            )
+
+        if "log_line" in msg and msg["log_line"]:
+            append_log_line(
+                session_log_path,
+                format_huginn_line(msg["log_line"], extra_secrets=secrets_mask),
                 extra_secrets=secrets_mask,
             )
 
@@ -591,11 +605,12 @@ async def create_job_endpoint(
             },
         )
 
-    # Prechequeo de RAM estimada (volumen remuestreado a 1,5 mm) vs RAM disponible
+    # Prechequeo de RAM estimada (BASE_MB + k * vóxeles remuestreados a 1,5 mm) vs RAM disponible
     estimated_bytes = estimate_required_memory_bytes(
         shape,
         k=MEMORY_ESTIMATION_K,
         spacing=zooms,
+        base_mb=MEMORY_BASE_MB,
     )
     _, avail_bytes = get_system_memory_bytes()
     if avail_bytes is not None and estimated_bytes > avail_bytes:
@@ -607,7 +622,8 @@ async def create_job_endpoint(
             detail={
                 "detail": (
                     f"Memoria insuficiente para procesar el volumen {tuple(shape)}: "
-                    f"se estiman ~{est_mb} MB y hay ~{avail_mb} MB disponibles."
+                    f"se estiman ~{est_mb} MB y hay ~{avail_mb} MB disponibles. "
+                    "Usá un runtime con más RAM (p. ej. High-RAM en Colab) o un estudio con menos cortes."
                 ),
                 "error_code": "ERR_INSUFFICIENT_MEMORY",
                 "stage": "validating",
@@ -1059,15 +1075,19 @@ def start_server_colab(
             # 3. No matar un job en curso antes de intentar cualquier cierre/rearranque
             active_jobs = _find_active_processing_jobs()
             if active_jobs:
-                job_desc = ", ".join(
-                    f"{j.job_id[:8]} ({j.stage})" for j in active_jobs
-                )
-                msg = (
-                    "[huginn] Reinicio rechazado: hay trabajo(s) en procesamiento "
-                    f"[{job_desc}]. Esperá a que finalice antes de reiniciar el servicio."
-                )
-                print(msg, flush=True)
-                raise RuntimeError(msg)
+                first = active_jobs[0]
+                if len(active_jobs) == 1:
+                    msg = (
+                        f"No se reinicia el servicio: el job {first.job_id[:8]} está en etapa {first.stage}. "
+                        "Esperá a que termine o cancelalo desde la app"
+                    )
+                else:
+                    job_desc = ", ".join(f"{j.job_id[:8]} ({j.stage})" for j in active_jobs)
+                    msg = (
+                        f"No se reinicia el servicio: hay jobs en procesamiento [{job_desc}]. "
+                        "Esperá a que terminen o cancelalos desde la app"
+                    )
+                raise ActiveJobRestartError(msg)
 
             # 4. Cierre limpio de cualquier instancia/túnel previo roto o zombi
             _shutdown_existing_service()

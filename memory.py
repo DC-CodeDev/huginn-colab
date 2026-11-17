@@ -8,13 +8,28 @@ from typing import Any, Dict, Optional, Tuple
 # Coeficiente k provisional (múltiplo sobre el tamaño float32 del volumen remuestreado a 1,5 mm)
 from colab.session_log import append_log_line
 
-# Valor inicial provisional: a calibrar con mediciones reales de [mem-summary] en Colab.
-DEFAULT_MEMORY_ESTIMATION_K = 100.0
+# Constantes provisionales del modelo lineal: estimado_bytes = BASE_MB * MiB + k * voxeles_remuestreados
+# calibrados con 1 punto, revisar (estudio de 421 cortes, 1,3 mm, runtime ~12,7 GB RAM, pico RSS 7,36 GB)
+DEFAULT_MEMORY_BASE_MB = 4000.0  # calibrados con 1 punto, revisar
+DEFAULT_MEMORY_ESTIMATION_K = 150.0  # bytes por vóxel remuestreado a 1,5 mm; calibrados con 1 punto, revisar
 TARGET_RESAMPLE_SPACING_MM = 1.5
 
 
+def get_memory_base_mb() -> float:
+    """Obtiene la base fija de memoria (MB) configurable por HUGINN_MEMORY_BASE_MB."""
+    raw = os.environ.get("HUGINN_MEMORY_BASE_MB")
+    if raw is not None:
+        try:
+            val = float(raw)
+            if val >= 0:
+                return val
+        except ValueError:
+            pass
+    return DEFAULT_MEMORY_BASE_MB
+
+
 def get_memory_estimation_k() -> float:
-    """Obtiene el coeficiente k configurable para estimar RAM requerida."""
+    """Obtiene el coeficiente k (bytes por vóxel remuestreado) configurable por HUGINN_MEMORY_ESTIMATION_K."""
     raw = os.environ.get("HUGINN_MEMORY_ESTIMATION_K")
     if raw is not None:
         try:
@@ -101,24 +116,31 @@ def get_gpu_memory_bytes() -> Tuple[Optional[int], Optional[int], Optional[int]]
         return None, None, None
 
 
-def estimate_required_memory_bytes(
+def compute_volume_geometry_stats(
     shape: Tuple[int, ...],
-    k: Optional[float] = None,
     spacing: Optional[Tuple[float, ...]] = None,
     target_spacing_mm: float = TARGET_RESAMPLE_SPACING_MM,
-) -> int:
+) -> Dict[str, Any]:
     """
-    Estima la RAM de CPU necesaria para segmentar un volumen 3D a partir del volumen
-    remuestreado a 1,5 mm por eje: (forma * espaciado_header / 1,5) por eje.
-    Base: resampled_voxels * 4 bytes (float32) * k.
-    Si no se provee espaciado válido, usa las dimensiones brutas como fallback.
+    Calcula estadísticas numéricas de geometría del volumen (sin datos de paciente):
+    forma, espaciado (zooms), vóxeles originales y vóxeles remuestreados a 1,5 mm.
     """
     if len(shape) < 3:
-        return 0
-    coeff = k if (k is not None and k > 0) else get_memory_estimation_k()
+        return {
+            "shape": [int(d) for d in shape],
+            "spacing_mm": [round(float(z), 4) for z in spacing] if spacing is not None else None,
+            "original_voxels": 0,
+            "resampled_voxels": 0,
+            "target_spacing_mm": float(target_spacing_mm),
+        }
+
+    shape_3 = [int(shape[0]), int(shape[1]), int(shape[2])]
+    original_voxels = shape_3[0] * shape_3[1] * shape_3[2]
+
     dims = []
+    spacing_3 = []
     for i in range(3):
-        dim = float(shape[i])
+        dim = float(shape_3[i])
         if (
             spacing is not None
             and len(spacing) > i
@@ -126,10 +148,43 @@ def estimate_required_memory_bytes(
             and float(spacing[i]) > 0
             and target_spacing_mm > 0
         ):
-            dim = dim * (float(spacing[i]) / float(target_spacing_mm))
+            sp = float(spacing[i])
+            spacing_3.append(round(sp, 4))
+            dim = dim * (sp / float(target_spacing_mm))
         dims.append(max(0.0, dim))
-    resampled_voxels = dims[0] * dims[1] * dims[2]
-    return int(resampled_voxels * 4 * coeff)
+
+    resampled_voxels = int(round(dims[0] * dims[1] * dims[2]))
+    return {
+        "shape": shape_3,
+        "spacing_mm": spacing_3 if len(spacing_3) == 3 else None,
+        "original_voxels": original_voxels,
+        "resampled_voxels": resampled_voxels,
+        "target_spacing_mm": float(target_spacing_mm),
+    }
+
+
+def estimate_required_memory_bytes(
+    shape: Tuple[int, ...],
+    k: Optional[float] = None,
+    spacing: Optional[Tuple[float, ...]] = None,
+    target_spacing_mm: float = TARGET_RESAMPLE_SPACING_MM,
+    base_mb: Optional[float] = None,
+) -> int:
+    """
+    Estima la RAM de CPU necesaria para segmentar un volumen 3D:
+    estimado = BASE_MB + k * vóxeles_remuestreados (a 1,5 mm por eje).
+    Si no se provee espaciado válido, usa las dimensiones brutas como fallback.
+    """
+    if len(shape) < 3:
+        return 0
+    base = base_mb if (base_mb is not None and base_mb >= 0) else get_memory_base_mb()
+    coeff = k if (k is not None and k > 0) else get_memory_estimation_k()
+    stats = compute_volume_geometry_stats(
+        shape,
+        spacing=spacing,
+        target_spacing_mm=target_spacing_mm,
+    )
+    return int(base * 1024.0 * 1024.0 + stats["resampled_voxels"] * coeff)
 
 
 class StageMemorySampler:

@@ -12,9 +12,13 @@ from fastapi.testclient import TestClient
 
 from colab import server
 from colab.memory import (
+    DEFAULT_MEMORY_BASE_MB,
     DEFAULT_MEMORY_ESTIMATION_K,
     StageMemorySampler,
+    compute_volume_geometry_stats,
     estimate_required_memory_bytes,
+    get_memory_base_mb,
+    get_memory_estimation_k,
 )
 
 
@@ -93,49 +97,58 @@ def test_health_reports_system_ram(client: TestClient, auth_header: Dict[str, st
     assert isinstance(data["ram_available_mb"], float) and data["ram_available_mb"] > 0
 
 
-def test_default_memory_estimation_k_is_100():
-    assert DEFAULT_MEMORY_ESTIMATION_K == 100.0
+def test_default_memory_constants_and_env_config(monkeypatch):
+    assert DEFAULT_MEMORY_BASE_MB == 4000.0
+    assert DEFAULT_MEMORY_ESTIMATION_K == 150.0
+
+    monkeypatch.setenv("HUGINN_MEMORY_BASE_MB", "3500")
+    monkeypatch.setenv("HUGINN_MEMORY_ESTIMATION_K", "180")
+    assert get_memory_base_mb() == 3500.0
+    assert get_memory_estimation_k() == 180.0
 
 
-def test_estimate_required_memory_bytes_scales_with_dimensions_and_k():
-    est_k10 = estimate_required_memory_bytes((100, 100, 50), k=10.0)
-    est_k20 = estimate_required_memory_bytes((100, 100, 50), k=20.0)
-    assert est_k10 == 100 * 100 * 50 * 4 * 10
-    assert est_k20 == 2 * est_k10
+def test_estimate_required_memory_bytes_linear_model():
+    # estimado = BASE_MB + k * resampled_voxels (k en bytes por vóxel)
+    est_k100 = estimate_required_memory_bytes((100, 100, 50), k=100.0, base_mb=4000.0)
+    est_k200 = estimate_required_memory_bytes((100, 100, 50), k=200.0, base_mb=4000.0)
+    base_bytes = 4000 * 1024 * 1024
+    voxels = 100 * 100 * 50
+    assert est_k100 == base_bytes + voxels * 100
+    assert est_k200 == base_bytes + voxels * 200
 
 
 def test_estimate_required_memory_bytes_resampled_thin_vs_thick_slices():
-    # Caso de cortes finos: muchos cortes de 0,5 mm (512x512x600 a 0.75x0.75x0.5 mm)
-    # Remuestreado a 1,5 mm: (256, 256, 200) -> 13.1M vóxeles (vs 157.3M brutos)
+    # Caso de cortes finos: 600 cortes de 0,5 mm (512x512x600 a 0.75x0.75x0.5 mm)
+    # Remuestreado a 1,5 mm: (256, 256, 200) -> ~13.1M vóxeles
     est_thin = estimate_required_memory_bytes(
         (512, 512, 600),
         spacing=(0.75, 0.75, 0.5),
-        k=100.0,
+        k=150.0,
+        base_mb=4000.0,
     )
-    expected_thin = int((512 * 0.75 / 1.5) * (512 * 0.75 / 1.5) * (600 * 0.5 / 1.5) * 4 * 100.0)
-    assert est_thin == expected_thin
-    assert est_thin < 6 * 1024**3  # Cabe en runtime gratis (~12 GB) pese a tener 600 cortes
+    thin_voxels = round((512 * 0.75 / 1.5) * (512 * 0.75 / 1.5) * (600 * 0.5 / 1.5))
+    assert est_thin == int(4000 * 1024**2 + thin_voxels * 150.0)
+    assert est_thin < 8 * 1024**3  # Entra en runtime gratis (~11,5 GB disponibles)
 
     # Caso de cortes gruesos: 100 cortes de 5,0 mm (512x512x100 a 0.75x0.75x5.0 mm)
-    # Remuestreado a 1,5 mm: (256, 256, 333.33) -> 21.8M vóxeles (mayor que 256x256x100)
+    # Remuestreado a 1,5 mm: (256, 256, 333.33) -> ~21.8M vóxeles
     est_thick = estimate_required_memory_bytes(
         (512, 512, 100),
         spacing=(0.75, 0.75, 5.0),
-        k=100.0,
+        k=150.0,
+        base_mb=4000.0,
     )
-    expected_thick = int((512 * 0.75 / 1.5) * (512 * 0.75 / 1.5) * (100 * 5.0 / 1.5) * 4 * 100.0)
-    assert est_thick == expected_thick
+    thick_voxels = round((512 * 0.75 / 1.5) * (512 * 0.75 / 1.5) * (100 * 5.0 / 1.5))
+    assert est_thick == int(4000 * 1024**2 + thick_voxels * 150.0)
     assert est_thick > est_thin
 
-    # Escenario de calibración con k=100: ~500 cortes (0.9x0.9x1.0 mm) excede ~12 GB;
-    # 107 cortes (0.7x0.7x2.5 mm) y 212 cortes (0.7x0.7x1.5 mm) caben en ~12 GB.
+    # Punto de calibración real: 421 cortes de 1,3 mm (~0.7x0.7x1.3) entra en ~11.5 GB libres
+    # Estudio mucho más largo (900 cortes a 1,5 mm, 512x512 a 0.9x0.9x1.5) excede ~11.5 GB libres
     free_colab_avail = 11.5 * 1024**3
-    est_500 = estimate_required_memory_bytes((512, 512, 500), spacing=(0.9, 0.9, 1.0), k=100.0)
-    est_107 = estimate_required_memory_bytes((512, 512, 107), spacing=(0.7, 0.7, 2.5), k=100.0)
-    est_212 = estimate_required_memory_bytes((512, 512, 212), spacing=(0.7, 0.7, 1.5), k=100.0)
-    assert est_500 > free_colab_avail
-    assert est_107 < free_colab_avail
-    assert est_212 < free_colab_avail
+    est_421 = estimate_required_memory_bytes((512, 512, 421), spacing=(0.7, 0.7, 1.3), k=150.0, base_mb=4000.0)
+    est_900 = estimate_required_memory_bytes((512, 512, 900), spacing=(0.9, 0.9, 1.5), k=150.0, base_mb=4000.0)
+    assert est_421 < free_colab_avail
+    assert est_900 > free_colab_avail
 
 
 def test_create_job_precheck_uses_header_spacing_resampled_at_1_5mm(
@@ -143,12 +156,13 @@ def test_create_job_precheck_uses_header_spacing_resampled_at_1_5mm(
     auth_header: Dict[str, str],
     monkeypatch,
 ):
-    # 40x40x60 con cortes finos (0.75x0.75x0.5 mm):
-    # Bruto: 96,000 vóxeles * 4 * 100 = 38.4 MB
-    # Remuestreado 1.5mm: 20 * 20 * 20 = 8,000 vóxeles * 4 * 100 = 3.2 MB
-    # Con 10 MB libres: bruto fallaría, remuestreado debe aceptarse.
-    monkeypatch.setattr(server, "get_system_memory_bytes", lambda: (1024**3, 10 * 1024 * 1024))
-    monkeypatch.setattr(server, "MEMORY_ESTIMATION_K", 100.0)
+    # Con BASE_MB=4000 y k=150:
+    # 40x40x60 con cortes finos (0.75x0.75x0.5 mm) -> 8,000 vóxeles remuestreados -> ~4001.1 MB
+    # 20x20x20 con cortes gruesos (3.0x3.0x4.5 mm) -> 96,000 vóxeles remuestreados -> ~4013.7 MB
+    # Con 4005 MB disponibles: cortes finos entra (201), cortes gruesos se rechaza (422).
+    monkeypatch.setattr(server, "get_system_memory_bytes", lambda: (12 * 1024**3, 4005 * 1024 * 1024))
+    monkeypatch.setattr(server, "MEMORY_BASE_MB", 4000.0)
+    monkeypatch.setattr(server, "MEMORY_ESTIMATION_K", 150.0)
 
     thin_bytes = _create_synthetic_nifti_bytes(shape=(40, 40, 60), spacing=(0.75, 0.75, 0.5))
     res_thin = client.post(
@@ -159,10 +173,6 @@ def test_create_job_precheck_uses_header_spacing_resampled_at_1_5mm(
     assert res_thin.status_code == 201
     client.delete(f"/jobs/{res_thin.json()['job_id']}", headers=auth_header)
 
-    # 20x20x20 con cortes gruesos (3.0x3.0x4.5 mm):
-    # Bruto: 8,000 vóxeles * 4 * 100 = 3.2 MB
-    # Remuestreado 1.5mm: 40 * 40 * 60 = 96,000 vóxeles * 4 * 100 = 38.4 MB
-    # Con 10 MB libres: bruto pasaría, remuestreado debe rechazarse (422).
     thick_bytes = _create_synthetic_nifti_bytes(shape=(20, 20, 20), spacing=(3.0, 3.0, 4.5))
     res_thick = client.post(
         "/jobs",
@@ -178,9 +188,10 @@ def test_create_job_rejects_insufficient_memory_before_processing(
     auth_header: Dict[str, str],
     monkeypatch,
 ):
-    # Simular que solo quedan 100 KB disponibles y que el volumen requiere más
-    monkeypatch.setattr(server, "get_system_memory_bytes", lambda: (1024 * 1024 * 1024, 100 * 1024))
-    monkeypatch.setattr(server, "MEMORY_ESTIMATION_K", 100.0)
+    # Simular que solo quedan 3500 MB disponibles (< BASE_MB=4000)
+    monkeypatch.setattr(server, "get_system_memory_bytes", lambda: (12 * 1024**3, 3500 * 1024 * 1024))
+    monkeypatch.setattr(server, "MEMORY_BASE_MB", 4000.0)
+    monkeypatch.setattr(server, "MEMORY_ESTIMATION_K", 150.0)
 
     before_jobs = set(server.jobs_db.keys())
     nii_bytes = _create_synthetic_nifti_bytes(shape=(20, 20, 10))
@@ -195,6 +206,9 @@ def test_create_job_rejects_insufficient_memory_before_processing(
     assert payload["error_code"] == "ERR_INSUFFICIENT_MEMORY"
     assert payload["stage"] == "validating"
     assert "Memoria insuficiente" in payload["detail"]
+    assert "3500.0 MB" in payload["detail"]
+    assert "más RAM" in payload["detail"]
+    assert "menos cortes" in payload["detail"]
     # No debe haberse encolado ningún trabajo
     assert set(server.jobs_db.keys()) == before_jobs
 
@@ -205,7 +219,8 @@ def test_create_job_accepts_when_memory_sufficient(
     monkeypatch,
 ):
     monkeypatch.setattr(server, "get_system_memory_bytes", lambda: (16 * 1024**3, 12 * 1024**3))
-    monkeypatch.setattr(server, "MEMORY_ESTIMATION_K", 100.0)
+    monkeypatch.setattr(server, "MEMORY_BASE_MB", 4000.0)
+    monkeypatch.setattr(server, "MEMORY_ESTIMATION_K", 150.0)
 
     nii_bytes = _create_synthetic_nifti_bytes(shape=(20, 20, 10))
     res = client.post(

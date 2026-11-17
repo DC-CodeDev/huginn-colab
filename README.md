@@ -56,6 +56,6 @@ Los siguientes campos son opcionales y retrocompatibles con clientes 2.0:
   - `ram_total_mb` (`number | null`): RAM total del sistema en MiB.
   - `ram_available_mb` (`number | null`): RAM disponible del sistema en MiB.
 - `GET /jobs/{job_id}`:
-  - `diagnostics` (`object | null`): resumen de consumo de memoria por etapa (`stages.<etapa>` con `duration_seconds`, `samples`, `peak_rss_mb`, `peak_sys_used_mb`, `min_sys_avail_mb`, `peak_vram_used_mb`, `peak_vram_allocated_mb`), sin datos de paciente.
+  - `diagnostics` (`object | null`): resumen de consumo de memoria por etapa (`stages.<etapa>` con `duration_seconds`, `samples`, `peak_rss_mb`, `peak_sys_used_mb`, `min_sys_avail_mb`, `peak_vram_used_mb`, `peak_vram_allocated_mb`) y geometría numérica del volumen (`volume` con `shape`, `spacing_mm`, `original_voxels`, `resampled_voxels`, `target_spacing_mm`, `estimated_ram_mb`), sin datos de paciente.
 - `POST /jobs`:
-  - Prechequeo de RAM antes de procesar usando el volumen remuestreado a 1,5 mm por eje y `HUGINN_MEMORY_ESTIMATION_K` (valor inicial provisional `100.0`, a calibrar con mediciones reales de `[mem-summary]`). Si la memoria estimada supera la RAM disponible, rechaza con HTTP `422`, `error_code: "ERR_INSUFFICIENT_MEMORY"` y `stage: "validating"`.
+  - Prechequeo de RAM antes de procesar usando `BASE_MB + k * vóxeles_remuestreados` a 1,5 mm por eje (`HUGINN_MEMORY_BASE_MB=4000.0`, `HUGINN_MEMORY_ESTIMATION_K=150.0` bytes/vóxel; calibrados con 1 punto, revisar en `docs/calibracion-memoria.md`). Si la memoria estimada supera la RAM disponible, rechaza con HTTP `422`, `error_code: "ERR_INSUFFICIENT_MEMORY"` y `stage: "validating"`.

@@ -25,3 +25,13 @@ def test_notebook_has_no_zip_upload():
     assert "RAMA_O_ETIQUETA" in content
     assert "NGROK_DOMAIN" in content
     assert "APP_URL" in content
+
+
+def test_notebook_handles_active_job_restart_without_traceback():
+    nb = nbformat.read(NOTEBOOK_PATH, as_version=4)
+    server_cells = [c for c in nb.cells if c.cell_type == "code" and "start_server_colab" in c.source]
+    assert len(server_cells) == 1
+    src = server_cells[0].source
+    assert "ActiveJobRestartError" in src
+    assert "except ActiveJobRestartError" in src
+    assert "print(" in src

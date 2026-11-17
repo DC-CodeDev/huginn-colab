@@ -189,12 +189,21 @@ def test_worker_labels_identical_voxel_by_voxel_and_emits_diagnostics(tmp_path, 
     completed_msgs = [m for m in messages if m.get("status") == "completed"]
     assert len(completed_msgs) == 1
     diag = completed_msgs[0]["diagnostics"]
+    assert "volume" in diag
+    assert diag["volume"]["shape"] == [10, 10, 8]
+    assert diag["volume"]["spacing_mm"] == [1.0, 1.0, 2.0]
+    assert diag["volume"]["original_voxels"] == 800
+    assert diag["volume"]["resampled_voxels"] == round((10 * 1.0 / 1.5) * (10 * 1.0 / 1.5) * (8 * 2.0 / 1.5))
     for stage in ("validating", "locating_l3", "segmenting_tissues", "packaging"):
         assert stage in diag["stages"]
         assert diag["stages"][stage]["samples"] >= 1
         assert diag["stages"][stage]["peak_rss_mb"] is not None
 
+    log_lines = [m["log_line"] for m in messages if "log_line" in m]
+    assert any("[volume]" in line and "orig_voxels=800" in line for line in log_lines)
+
     captured = capsys.readouterr()
+    assert "[volume]" in captured.out
     assert "[mem]" in captured.out
     assert "[mem-summary]" in captured.out
     assert "Paciente Secreto" not in captured.out

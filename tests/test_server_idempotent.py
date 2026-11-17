@@ -220,10 +220,14 @@ def test_active_job_blocks_restart_without_killing_server_or_subprocess(monkeypa
     server.jobs_db[job.job_id] = job
 
     srv = server._runtime_state.server
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(server.ActiveJobRestartError) as exc_info:
         server.start_server_colab(monitor=False)
 
-    assert "abcdef12" in str(exc_info.value)
+    assert isinstance(exc_info.value, RuntimeError)
+    assert str(exc_info.value) == (
+        "No se reinicia el servicio: el job abcdef12 está en etapa segmenting_tissues. "
+        "Esperá a que termine o cancelalo desde la app"
+    )
     assert not srv.should_exit
     assert calls["kill"] == kill_before
     fake_proc.terminate.assert_not_called()
