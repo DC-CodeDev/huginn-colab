@@ -1051,12 +1051,13 @@ def start_server_colab(
 
     from colab.version import LOADED_COMMIT_HASH
 
-    print(format_version_banner(), flush=True)
     resolved_app_url = _resolve_app_url(app_url)
 
     # 1. Commit distinto en disco: no reiniciar en el mismo kernel
     stale_msg = check_code_staleness()
     if stale_msg:
+        print("[huginn] Hay una versión más nueva del servicio: reiniciá el entorno.", flush=True)
+        print(format_version_banner(), flush=True)
         print("\n========================================================")
         print(f"⚠️  {STALE_RESTART_BANNER}")
         print(f"Detalle: {stale_msg}")
@@ -1067,7 +1068,8 @@ def start_server_colab(
     with _runtime_lock:
         if _is_own_server_healthy():
             public_url = str(_runtime_state.public_url)
-            print("[huginn] Servicio ya activo, reconectando monitor", flush=True)
+            print("[huginn] Servicio ya activo: reconectando el monitor (sin reiniciar).", flush=True)
+            print(format_version_banner(), flush=True)
             _print_connection_banner(public_url, resolved_app_url)
             reuse_monitor = True
         else:
@@ -1075,6 +1077,8 @@ def start_server_colab(
             # 3. No matar un job en curso antes de intentar cualquier cierre/rearranque
             active_jobs = _find_active_processing_jobs()
             if active_jobs:
+                print("[huginn] No se reinicia: hay un trabajo en procesamiento.", flush=True)
+                print(format_version_banner(), flush=True)
                 first = active_jobs[0]
                 if len(active_jobs) == 1:
                     msg = (
@@ -1088,6 +1092,20 @@ def start_server_colab(
                         "Esperá a que terminen o cancelalos desde la app"
                     )
                 raise ActiveJobRestartError(msg)
+
+            had_previous_service = (
+                _runtime_state.server is not None
+                or _runtime_state.thread is not None
+                or _runtime_state.public_url is not None
+            )
+            if had_previous_service:
+                print(
+                    "[huginn] Servicio anterior con problemas: se cierra y se arranca de nuevo.",
+                    flush=True,
+                )
+            else:
+                print("[huginn] Servicio nuevo: arrancando.", flush=True)
+            print(format_version_banner(), flush=True)
 
             # 4. Cierre limpio de cualquier instancia/túnel previo roto o zombi
             _shutdown_existing_service()

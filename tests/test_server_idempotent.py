@@ -118,6 +118,7 @@ def test_double_start_reattaches_monitor_without_restarting(monkeypatch, capsys)
     assert first_server is not None and first_thread is not None and first_thread.is_alive()
 
     out1 = capsys.readouterr().out
+    assert out1.splitlines()[0] == "[huginn] Servicio nuevo: arrancando."
     assert "Servicio accesible desde internet" in out1
 
     # Segunda ejecución en el mismo proceso: no reinicia, reengancha monitor
@@ -129,7 +130,7 @@ def test_double_start_reattaches_monitor_without_restarting(monkeypatch, capsys)
     assert server._runtime_state.thread is first_thread
 
     out2 = capsys.readouterr().out
-    assert "Servicio ya activo, reconectando monitor" in out2
+    assert out2.splitlines()[0] == "[huginn] Servicio ya activo: reconectando el monitor (sin reiniciar)."
     assert "CODIGO DE CONEXION: HGN1-" in out2
 
     # Verificar que ni API_TOKEN ni HGN1- aparecen en session.log ni job logs
@@ -141,7 +142,7 @@ def test_double_start_reattaches_monitor_without_restarting(monkeypatch, capsys)
         assert "HGN1-" not in text
 
 
-def test_double_start_restarts_cleanly_when_tunnel_died_without_zombie(monkeypatch):
+def test_double_start_restarts_cleanly_when_tunnel_died_without_zombie(monkeypatch, capsys):
     port = _free_port()
     monkeypatch.setattr(server, "PORT", port)
     monkeypatch.setattr(server, "check_code_staleness", lambda *a, **kw: None)
@@ -154,11 +155,14 @@ def test_double_start_restarts_cleanly_when_tunnel_died_without_zombie(monkeypat
     assert url1 == public_url
     first_server = server._runtime_state.server
     first_thread = server._runtime_state.thread
+    capsys.readouterr()
 
     # Simular que el túnel ngrok cayó aunque uvicorn seguía vivo
     tunnels.clear()
 
     url2 = server.start_server_colab(monitor=False)
+    out2 = capsys.readouterr().out
+    assert out2.splitlines()[0] == "[huginn] Servicio anterior con problemas: se cierra y se arranca de nuevo."
     assert url2 == public_url
     assert calls["connect"] == 2
     assert calls["kill"] >= 1
@@ -195,10 +199,11 @@ def test_different_commit_prints_restart_banner_and_does_not_restart(monkeypatch
     assert not first_server.should_exit
 
     out = capsys.readouterr().out
+    assert out.splitlines()[0] == "[huginn] Hay una versión más nueva del servicio: reiniciá el entorno."
     assert "Hay una versión más nueva del servicio. Para cargarla: Entorno de ejecución > Reiniciar sesión y ejecutar todo" in out
 
 
-def test_active_job_blocks_restart_without_killing_server_or_subprocess(monkeypatch):
+def test_active_job_blocks_restart_without_killing_server_or_subprocess(monkeypatch, capsys):
     port = _free_port()
     monkeypatch.setattr(server, "PORT", port)
     monkeypatch.setattr(server, "check_code_staleness", lambda *a, **kw: None)
@@ -208,6 +213,7 @@ def test_active_job_blocks_restart_without_killing_server_or_subprocess(monkeypa
     _route_public_probe_to_local(monkeypatch, public_url, port)
     server.start_server_colab(monitor=False)
     kill_before = calls["kill"]
+    capsys.readouterr()
 
     # Romper túnel para forzar camino de reinicio, pero con un job activo en curso
     tunnels.clear()
@@ -223,6 +229,8 @@ def test_active_job_blocks_restart_without_killing_server_or_subprocess(monkeypa
     with pytest.raises(server.ActiveJobRestartError) as exc_info:
         server.start_server_colab(monitor=False)
 
+    out_active = capsys.readouterr().out
+    assert out_active.splitlines()[0] == "[huginn] No se reinicia: hay un trabajo en procesamiento."
     assert isinstance(exc_info.value, RuntimeError)
     assert str(exc_info.value) == (
         "No se reinicia el servicio: el job abcdef12 está en etapa segmenting_tissues. "
