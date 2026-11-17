@@ -198,3 +198,35 @@ def test_worker_labels_identical_voxel_by_voxel_and_emits_diagnostics(tmp_path, 
     assert "[mem]" in captured.out
     assert "[mem-summary]" in captured.out
     assert "Paciente Secreto" not in captured.out
+
+
+def test_call_totalsegmentator_introspection_and_logging(caplog):
+    import logging
+    from colab.pipeline import _call_totalsegmentator
+
+    received = {}
+
+    def fn_with_thr(input, output, task, nr_thr_saving=None, nr_thr_resamp=None):
+        received["with_thr"] = (nr_thr_saving, nr_thr_resamp)
+
+    def fn_without_thr(input, output, task):
+        received["without_thr"] = True
+
+    def fn_with_kwargs(**kwargs):
+        received["with_kwargs"] = (kwargs.get("nr_thr_saving"), kwargs.get("nr_thr_resamp"))
+
+    with caplog.at_level(logging.INFO, logger="huginn.pipeline"):
+        _call_totalsegmentator(fn_with_thr, input="a", output="b", task="total")
+        assert received["with_thr"] == (1, 1)
+        assert not caplog.records
+
+        _call_totalsegmentator(fn_with_kwargs, input="a", output="b", task="total")
+        assert received["with_kwargs"] == (1, 1)
+        assert not caplog.records
+
+        _call_totalsegmentator(fn_without_thr, input="a", output="b", task="total")
+        assert received["without_thr"] is True
+        assert any(
+            "nr_thr_saving" in rec.message and "nr_thr_resamp" in rec.message
+            for rec in caplog.records
+        )

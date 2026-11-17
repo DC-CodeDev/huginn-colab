@@ -503,6 +503,7 @@ async def create_job_endpoint(
     try:
         nii = nib.load(temp_nii_path)
         shape = nii.shape
+        zooms = tuple(float(z) for z in nii.header.get_zooms()[:3])
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(
@@ -524,8 +525,12 @@ async def create_job_endpoint(
             },
         )
 
-    # Prechequeo de RAM estimada vs RAM disponible antes de encolar/procesar
-    estimated_bytes = estimate_required_memory_bytes(shape, k=MEMORY_ESTIMATION_K)
+    # Prechequeo de RAM estimada (volumen remuestreado a 1,5 mm) vs RAM disponible
+    estimated_bytes = estimate_required_memory_bytes(
+        shape,
+        k=MEMORY_ESTIMATION_K,
+        spacing=zooms,
+    )
     _, avail_bytes = get_system_memory_bytes()
     if avail_bytes is not None and estimated_bytes > avail_bytes:
         est_mb = round(estimated_bytes / (1024.0 * 1024.0), 1)

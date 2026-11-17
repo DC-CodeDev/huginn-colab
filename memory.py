@@ -5,8 +5,10 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-# Coeficiente k conservador (múltiplo sobre el tamaño float32 del volumen) — a calibrar con mediciones reales
-DEFAULT_MEMORY_ESTIMATION_K = 20.0
+# Coeficiente k provisional (múltiplo sobre el tamaño float32 del volumen remuestreado a 1,5 mm)
+# Valor inicial provisional: a calibrar con mediciones reales de [mem-summary] en Colab.
+DEFAULT_MEMORY_ESTIMATION_K = 100.0
+TARGET_RESAMPLE_SPACING_MM = 1.5
 
 
 def get_memory_estimation_k() -> float:
@@ -100,16 +102,32 @@ def get_gpu_memory_bytes() -> Tuple[Optional[int], Optional[int], Optional[int]]
 def estimate_required_memory_bytes(
     shape: Tuple[int, ...],
     k: Optional[float] = None,
+    spacing: Optional[Tuple[float, ...]] = None,
+    target_spacing_mm: float = TARGET_RESAMPLE_SPACING_MM,
 ) -> int:
     """
-    Estima la RAM de CPU necesaria para segmentar un volumen 3D a partir de sus dimensiones.
-    Base: voxels * 4 bytes (float32) * k.
+    Estima la RAM de CPU necesaria para segmentar un volumen 3D a partir del volumen
+    remuestreado a 1,5 mm por eje: (forma * espaciado_header / 1,5) por eje.
+    Base: resampled_voxels * 4 bytes (float32) * k.
+    Si no se provee espaciado válido, usa las dimensiones brutas como fallback.
     """
     if len(shape) < 3:
         return 0
     coeff = k if (k is not None and k > 0) else get_memory_estimation_k()
-    voxels = int(shape[0]) * int(shape[1]) * int(shape[2])
-    return int(voxels * 4 * coeff)
+    dims = []
+    for i in range(3):
+        dim = float(shape[i])
+        if (
+            spacing is not None
+            and len(spacing) > i
+            and spacing[i] is not None
+            and float(spacing[i]) > 0
+            and target_spacing_mm > 0
+        ):
+            dim = dim * (float(spacing[i]) / float(target_spacing_mm))
+        dims.append(max(0.0, dim))
+    resampled_voxels = dims[0] * dims[1] * dims[2]
+    return int(resampled_voxels * 4 * coeff)
 
 
 class StageMemorySampler:

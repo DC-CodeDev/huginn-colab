@@ -58,4 +58,4 @@ Los siguientes campos son opcionales y retrocompatibles con clientes 2.0:
 - `GET /jobs/{job_id}`:
   - `diagnostics` (`object | null`): resumen de consumo de memoria por etapa (`stages.<etapa>` con `duration_seconds`, `samples`, `peak_rss_mb`, `peak_sys_used_mb`, `min_sys_avail_mb`, `peak_vram_used_mb`, `peak_vram_allocated_mb`), sin datos de paciente.
 - `POST /jobs`:
-  - Prechequeo de RAM antes de procesar usando `HUGINN_MEMORY_ESTIMATION_K` (por defecto `20.0`, a calibrar con mediciones reales). Si la memoria estimada supera la RAM disponible, rechaza con HTTP `422`, `error_code: "ERR_INSUFFICIENT_MEMORY"` y `stage: "validating"`.
+  - Prechequeo de RAM antes de procesar usando el volumen remuestreado a 1,5 mm por eje y `HUGINN_MEMORY_ESTIMATION_K` (valor inicial provisional `100.0`, a calibrar con mediciones reales de `[mem-summary]`). Si la memoria estimada supera la RAM disponible, rechaza con HTTP `422`, `error_code: "ERR_INSUFFICIENT_MEMORY"` y `stage: "validating"`.

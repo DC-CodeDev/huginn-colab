@@ -47,16 +47,27 @@ def _call_totalsegmentator(totalsegmentator_fn: Any, **kwargs: Any) -> Any:
     """
     Invoca totalsegmentator añadiendo nr_thr_saving=1 y nr_thr_resamp=1
     si la firma de la función (o **kwargs) los acepta, para reducir uso de RAM.
+    Si la firma no los acepta, registra una línea informándolo.
     """
     try:
         params = inspect.signature(totalsegmentator_fn).parameters
         accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        unsupported: List[str] = []
         if accepts_kwargs or "nr_thr_saving" in params:
             kwargs.setdefault("nr_thr_saving", 1)
+        else:
+            unsupported.append("nr_thr_saving")
         if accepts_kwargs or "nr_thr_resamp" in params:
             kwargs.setdefault("nr_thr_resamp", 1)
-    except Exception:
-        pass
+        else:
+            unsupported.append("nr_thr_resamp")
+        if unsupported:
+            log.info(
+                "totalsegmentator no acepta %s en su firma; se omite(n).",
+                ", ".join(unsupported),
+            )
+    except Exception as exc:
+        log.info("No se pudo inspeccionar la firma de totalsegmentator: %s", exc)
     return totalsegmentator_fn(**kwargs)
 
 
