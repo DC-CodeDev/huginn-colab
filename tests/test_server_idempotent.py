@@ -312,3 +312,62 @@ def test_public_health_check_failure_reports_reason_without_secrets(monkeypatch,
     assert "No se pudo verificar /health por la URL pública (connection refused)" in out
     assert "fake-ngrok-secret-token-12345" not in out
     assert f"Bearer {server.API_TOKEN}" not in out
+
+
+def test_cors_allowed_origins_restricts_wildcard_and_keeps_local_dev(monkeypatch):
+    monkeypatch.delenv("HUGINN_ALLOWED_ORIGIN", raising=False)
+    monkeypatch.delenv("HUGINN_APP_URL", raising=False)
+    monkeypatch.delenv("HUGINN_ALLOW_LOCAL_DEV", raising=False)
+    monkeypatch.setattr(server, "_get_secret", lambda _name: "")
+
+    default_origins = server._resolve_allowed_origins()
+    assert "*" not in default_origins
+    assert "https://visor-dicom-l3.bylgjalabs.workers.dev" in default_origins
+    assert "http://localhost:5174" in default_origins
+    assert "http://127.0.0.1:5174" in default_origins
+
+    monkeypatch.setenv("HUGINN_APP_URL", "https://huginn-v2.pages.dev/subruta/")
+    with_app_url = server._resolve_allowed_origins()
+    assert "https://huginn-v2.pages.dev" in with_app_url
+    assert "http://localhost:5174" in with_app_url
+    assert "*" not in with_app_url
+
+    monkeypatch.setenv("HUGINN_ALLOWED_ORIGIN", "https://custom.pages.dev, *")
+    with_explicit = server._resolve_allowed_origins()
+    assert "https://custom.pages.dev" in with_explicit
+    assert "*" not in with_explicit
+
+
+def test_cors_middleware_accepts_prod_and_local_dev_and_rejects_other():
+    from fastapi.testclient import TestClient
+
+    client = TestClient(server.app)
+
+    res_prod = client.options(
+        "/health",
+        headers={
+            "Origin": "https://visor-dicom-l3.bylgjalabs.workers.dev",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert res_prod.status_code == 200
+    assert res_prod.headers.get("access-control-allow-origin") == "https://visor-dicom-l3.bylgjalabs.workers.dev"
+
+    res_local = client.options(
+        "/health",
+        headers={
+            "Origin": "http://localhost:5174",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert res_local.status_code == 200
+    assert res_local.headers.get("access-control-allow-origin") == "http://localhost:5174"
+
+    res_evil = client.options(
+        "/health",
+        headers={
+            "Origin": "https://evil.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert res_evil.headers.get("access-control-allow-origin") is None

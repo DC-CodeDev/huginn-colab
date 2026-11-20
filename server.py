@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import fastapi
 from fastapi import FastAPI, File, Header, HTTPException, Request, Response, UploadFile, status
@@ -124,10 +125,66 @@ def setup_license(license_str: Optional[str]) -> bool:
 TOTALSEG_LICENSE = _get_secret("HUGINN_TOTALSEG_LICENSE")
 LICENSE_VALID = setup_license(TOTALSEG_LICENSE)
 
-# Origen permitido para CORS (Ajuste 7)
-ALLOWED_ORIGIN = os.environ.get("HUGINN_ALLOWED_ORIGIN", "*")
-if ALLOWED_ORIGIN == "*":
-    print("WARNING: HUGINN_ALLOWED_ORIGIN is set to '*'. For production, restrict this to your PWA origin.")
+# Origen permitido para CORS (Ajuste 7: sin comodín abierto; soporta producción + desarrollo local)
+DEFAULT_PROD_ORIGIN = "https://visor-dicom-l3.bylgjalabs.workers.dev"
+LOCAL_DEV_ORIGINS = [
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+]
+
+
+def _normalize_origin(raw: str) -> str:
+    cleaned = raw.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned == "*":
+        return "*"
+    parsed = urlparse(cleaned)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return cleaned
+
+
+def _resolve_allowed_origins() -> List[str]:
+    """Resuelve los orígenes CORS permitidos sin usar comodín abierto por defecto."""
+    origins: List[str] = []
+
+    raw_allowed = os.environ.get("HUGINN_ALLOWED_ORIGIN", "").strip()
+    if raw_allowed:
+        for item in raw_allowed.split(","):
+            norm = _normalize_origin(item)
+            if norm and norm != "*" and norm not in origins:
+                origins.append(norm)
+
+    raw_app_url = (
+        os.environ.get("HUGINN_APP_URL")
+        or _get_secret("APP_URL")
+        or ""
+    ).strip()
+    if raw_app_url:
+        norm_app = _normalize_origin(raw_app_url)
+        if norm_app and norm_app != "*" and norm_app not in origins:
+            origins.append(norm_app)
+
+    if not origins:
+        origins.append(DEFAULT_PROD_ORIGIN)
+
+    if os.environ.get("HUGINN_ALLOW_LOCAL_DEV", "1").strip() != "0":
+        for dev_origin in LOCAL_DEV_ORIGINS:
+            if dev_origin not in origins:
+                origins.append(dev_origin)
+
+    return origins
+
+
+ALLOWED_ORIGINS = _resolve_allowed_origins()
+if not os.environ.get("HUGINN_ALLOWED_ORIGIN", "").strip() and not (
+    os.environ.get("HUGINN_APP_URL") or _get_secret("APP_URL")
+):
+    print(
+        "INFO: CORS restringido a orígenes locales de desarrollo "
+        "(definí APP_URL o HUGINN_ALLOWED_ORIGIN para el origen de producción)."
+    )
 
 # Tamaño máximo de subida (Ajuste 6: 500 MB por defecto)
 MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("HUGINN_MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
@@ -461,7 +518,7 @@ app = FastAPI(
 # Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "*" else ["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*", "ngrok-skip-browser-warning"],
