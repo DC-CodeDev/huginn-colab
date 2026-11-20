@@ -126,7 +126,7 @@ TOTALSEG_LICENSE = _get_secret("HUGINN_TOTALSEG_LICENSE")
 LICENSE_VALID = setup_license(TOTALSEG_LICENSE)
 
 # Origen permitido para CORS (Ajuste 7: sin comodín abierto; soporta producción + desarrollo local)
-DEFAULT_PROD_ORIGIN = "https://visor-dicom-l3.bylgjalabs.workers.dev"
+DEFAULT_PROD_ORIGIN = "https://visor-dicom-l3.vercel.app"
 LOCAL_DEV_ORIGINS = [
     "http://localhost:5174",
     "http://127.0.0.1:5174",

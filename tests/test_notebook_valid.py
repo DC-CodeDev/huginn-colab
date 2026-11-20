@@ -42,5 +42,5 @@ def test_notebook_cell1_sets_default_app_url_and_warns_if_empty_or_invalid():
     cell1_cells = [c for c in nb.cells if c.cell_type == "code" and "APP_URL =" in c.source]
     assert len(cell1_cells) == 1
     src = cell1_cells[0].source
-    assert 'APP_URL = "https://visor-dicom-l3.bylgjalabs.workers.dev"' in src
+    assert 'APP_URL = "https://visor-dicom-l3.vercel.app"' in src
     assert "ADVERTENCIA: APP_URL está vacío o es inválido" in src
